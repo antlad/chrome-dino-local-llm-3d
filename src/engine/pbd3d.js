@@ -73,12 +73,18 @@ export class PhysicsWorld {
     this.groundY = opts.groundY ?? 0;
     this.iterations = opts.iterations ?? 4;
     this.substeps = opts.substeps ?? 4;
+    /** Metres per second a single particle may not exceed. 0 disables the clamp. */
+    this.maxSpeed = opts.maxSpeed ?? 22;
+    /** Radians a single angle iteration may apply. Bounds the 1/sin(theta)
+     *  blow-up of a collapsed limb without throttling the whole solver. */
+    this.maxAngleCorrection = opts.maxAngleCorrection ?? 0.35;
     this.corrections = []; // scratch, consumed by caller each step
 
     /** @type {Float32Array|null} */
     this.pos = null;
     this.prev = null;
     this.inv = null;
+    this.baseInv = null;
     this.radius = null;
     this.friction = null;
     this.pinned = null;
@@ -111,6 +117,7 @@ export class PhysicsWorld {
       this.pos = re3(this.pos);
       this.prev = re3(this.prev);
       this.inv = re1(this.inv);
+      this.baseInv = re1(this.baseInv);
       this.radius = re1(this.radius);
       this.friction = re1(this.friction);
       this.pinned = re1(this.pinned);
@@ -125,7 +132,8 @@ export class PhysicsWorld {
     this.prev[b + 1] = y - (spec.vy ?? 0) / 60;
     this.prev[b + 2] = z - (spec.vz ?? 0) / 60;
     const mass = spec.mass ?? 1;
-    this.inv[i] = spec.pinned ? 0 : 1 / Math.max(1e-4, mass);
+    this.baseInv[i] = 1 / Math.max(1e-4, mass);
+    this.inv[i] = spec.pinned ? 0 : this.baseInv[i];
     this.radius[i] = spec.radius ?? 0.06;
     this.friction[i] = spec.friction ?? 0.6;
     this.pinned[i] = spec.pinned ? 1 : 0;
@@ -146,11 +154,55 @@ export class PhysicsWorld {
   setPinned(i, on) {
     this.pinned[i] = on ? 1 : 0;
     if (on) {
+      // Freeze in place: inv = 0 makes integrate() and every constraint skip it,
+      // so a planted foot is a true world-space anchor, not a soft target.
+      this.inv[i] = 0;
       const b = i * 3;
       this.prev[b] = this.pos[b];
       this.prev[b + 1] = this.pos[b + 1];
       this.prev[b + 2] = this.pos[b + 2];
+    } else {
+      this.inv[i] = this.baseInv[i];
     }
+  }
+
+  /** True world-space anchor without zeroing velocity history. */
+  pinKeepingVel(i) {
+    this.pinned[i] = 1;
+    this.inv[i] = 0;
+  }
+
+  /** Velocity in world units / second, expressed the way integrate() stores it:
+   *  Verlet keeps one *substep* of history, so prev = p - v * (dt / substeps). */
+  setVelocity(i, vx, vy, vz, dt = 1 / 60, substeps = this.substeps) {
+    const h = dt / substeps;
+    const b = i * 3;
+    this.prev[b] = this.pos[b] - vx * h;
+    this.prev[b + 1] = this.pos[b + 1] - vy * h;
+    this.prev[b + 2] = this.pos[b + 2] - vz * h;
+  }
+
+  getVelocity(i, dt = 1 / 60, substeps = this.substeps) {
+    const h = dt / substeps;
+    const b = i * 3;
+    return [
+      (this.pos[b] - this.prev[b]) / h,
+      (this.pos[b + 1] - this.prev[b + 1]) / h,
+      (this.pos[b + 2] - this.prev[b + 2]) / h,
+    ];
+  }
+
+  /** Blend the current velocity toward a target without touching the rest. */
+  nudgeVelocity(i, vx, vy, vz, blend, dt = 1 / 60, substeps = this.substeps) {
+    if (this.inv[i] === 0) return;
+    const cur = this.getVelocity(i, dt, substeps);
+    this.setVelocity(
+      i,
+      cur[0] + (vx - cur[0]) * blend,
+      cur[1] + (vy - cur[1]) * blend,
+      cur[2] + (vz - cur[2]) * blend,
+      dt, substeps,
+    );
   }
 
   setPos(i, x, y, z) {
@@ -267,13 +319,26 @@ export class PhysicsWorld {
   integrate(h) {
     const { pos, prev, inv, gravity, damping } = this;
     const g = gravity * h * h;
+    // A hard ceiling on how far a particle may move in one substep. Verlet has no
+    // velocity variable to clamp, so the limit is expressed as displacement. This
+    // is the net under the whole engine: a badly conditioned constraint can still
+    // find energy, but it can no longer turn that energy into a dino in orbit.
+    const cap = this.maxSpeed > 0 ? this.maxSpeed * h : Infinity;
     for (let i = 0; i < this.count; i++) {
       if (inv[i] === 0) continue;
       const b = i * 3;
       const x = pos[b], y = pos[b + 1], z = pos[b + 2];
-      pos[b] = x + (x - prev[b]) * damping;
-      pos[b + 1] = y + (y - prev[b + 1]) * damping + g;
-      pos[b + 2] = z + (z - prev[b + 2]) * damping;
+      let dx = (x - prev[b]) * damping;
+      let dy = (y - prev[b + 1]) * damping;
+      let dz = (z - prev[b + 2]) * damping;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 > cap * cap) {
+        const k = cap / Math.sqrt(d2);
+        dx *= k; dy *= k; dz *= k;
+      }
+      pos[b] = x + dx;
+      pos[b + 1] = y + dy + g;
+      pos[b + 2] = z + dz;
       prev[b] = x; prev[b + 1] = y; prev[b + 2] = z;
     }
   }
@@ -363,6 +428,19 @@ export class PhysicsWorld {
       let gcy = (d1y * cosT - d0y) / sinT;
       let gcz = (d1z * cosT - d0z) / sinT;
       const gbx = -(gax + gcx), gby = -(gay + gcy), gbz = -(gaz + gcz);
+
+      // How much rotation a single angle iteration is allowed to apply, in radians.
+      // This belongs here rather than in the global displacement clamp because of
+      // how the gradient below behaves: its magnitude goes like 1/sin(theta), so a
+      // limb that has collapsed to a fold asks for a correction hundreds of times
+      // the link length. The global cap catches that eventually, but it catches it
+      // by throttling *every* particle in the world, which quietly starves the
+      // legitimate corrections of unrelated constraints nearby. Clipping the angle
+      // error at the source bounds the explosion and leaves the rest of the solver
+      // alone. It also converges better: a clipped correction walks to the limit
+      // over a few iterations instead of overshooting and being clawed back.
+      if (err > this.maxAngleCorrection) err = this.maxAngleCorrection;
+      else if (err < -this.maxAngleCorrection) err = -this.maxAngleCorrection;
 
       const s = err * stiff;
       // Scale each gradient by its own invMass, normalised by the squared sum.

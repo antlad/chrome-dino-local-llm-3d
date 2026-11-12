@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en" data-night="false">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#0b0e12">
+<title>Dino 3D</title>
+<link rel="stylesheet" href="./src/ui/styles.css">
+</head>
+<body>
+
+<!-- Full-bleed 3D scene. First element in the body, everything else floats on top. -->
+<canvas id="gl"></canvas>
+
+<div id="ui">
+
+  <!-- Top-left: the numbers that matter, then a small-caps meta row. -->
+  <header class="hud-block hud-topleft" id="block-score">
+    <p class="eyebrow">Distance</p>
+    <div id="score" class="score">00000</div>
+    <div class="stat-row">
+      <span class="stat"><span class="stat-k">Best</span> <span id="best" class="stat-v">00000</span></span>
+      <span class="stat-sep" aria-hidden="true">&middot;</span>
+      <span class="stat"><span id="speed" class="stat-v">0.0</span> <span class="stat-k">m/s</span></span>
+      <span class="stat-sep" aria-hidden="true">&middot;</span>
+      <span class="stat"><span id="stat-state" class="stat-v">menu</span></span>
+    </div>
+  </header>
+
+  <!-- Top-right: camera chips, pause, settings. -->
+  <header class="hud-block hud-topright" id="block-controls">
+    <div class="chip-row" id="camera-chips" role="group" aria-label="Camera mode"></div>
+    <div class="tool-row">
+      <button id="btn-pause" class="pill" type="button" aria-pressed="false">
+        <span class="pill-icon" aria-hidden="true"></span><span class="pill-label">Pause</span>
+      </button>
+      <button id="btn-settings" class="pill pill-icon-only" type="button"
+              aria-label="Settings" aria-expanded="false" aria-controls="settings">
+        <span class="pill-icon" aria-hidden="true"></span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Bottom-centre: the real controls, as keycaps. Collapses to a dot on phones. -->
+  <footer class="hint-strip" id="hint" aria-label="Controls">
+    <span class="hint-item"><kbd class="key">Space</kbd><span class="hint-t">Jump</span></span>
+    <span class="hint-item"><kbd class="key">Up</kbd><span class="hint-t">Jump</span></span>
+    <span class="hint-item"><kbd class="key">Down</kbd><span class="hint-t">Duck</span></span>
+    <span class="hint-item"><kbd class="key">C</kbd><span class="hint-t">Camera</span></span>
+    <span class="hint-item"><kbd class="key">P</kbd><span class="hint-t">Pause</span></span>
+    <span class="hint-item"><kbd class="key">R</kbd><span class="hint-t">Restart</span></span>
+    <span class="hint-item"><kbd class="key">1&ndash;7</kbd><span class="hint-t">Camera&nbsp;modes</span></span>
+    <span class="hint-item"><span class="key key-ghost">Drag</span><span class="hint-t">Orbit</span></span>
+    <span class="hint-item"><span class="key key-ghost">Scroll</span><span class="hint-t">Zoom</span></span>
+  </footer>
+
+  <!-- Transient floating labels (flash()). hud.js fills this from a fixed pool. -->
+  <div class="flash-layer" aria-hidden="true"></div>
+
+  <!-- 100 m milestone banner. -->
+  <div id="milestone" class="milestone" role="status" aria-live="polite"></div>
+
+  <!-- Full-screen damage vignette. Opacity is written from JS every frame. -->
+  <div id="hit-flash" aria-hidden="true"></div>
+
+  <!-- Slide-in settings. -->
+  <aside id="settings" class="settings" aria-label="Settings" aria-hidden="true">
+    <div class="settings-head">
+      <h2 class="settings-title">Settings</h2>
+      <button id="btn-settings-close" class="pill pill-icon-only pill-sm js-settings-close" type="button"
+              aria-label="Close settings"><span class="pill-icon" aria-hidden="true"></span></button>
+    </div>
+
+    <label class="field" for="quality">
+      <span class="field-label">Quality</span>
+      <select id="quality">
+        <option value="high">High</option>
+        <option value="low">Low</option>
+      </select>
+    </label>
+
+    <label class="field field-row" for="toggle-debug">
+      <span class="field-label">Debug overlay</span>
+      <input id="toggle-debug" class="switch" type="checkbox" role="switch">
+    </label>
+
+    <label class="field field-row" for="toggle-orbit">
+      <span class="field-label">Orbit auto-rotate</span>
+      <input id="toggle-orbit" class="switch" type="checkbox" role="switch">
+    </label>
+
+    <label class="field" for="slider-sens">
+      <span class="field-label">Drag sensitivity <output class="sens-out" for="slider-sens">1.0&times;</output></span>
+      <input id="slider-sens" class="slider" type="range" min="0.2" max="3" step="0.1" value="1">
+    </label>
+
+    <p class="settings-foot">Toggles mirror the keyboard. Escape closes.</p>
+  </aside>
+
+  <!-- Menu / game-over card. Backdrop only dims, the runner stays visible behind it. -->
+  <div id="overlay" class="overlay" role="dialog" aria-modal="false" aria-labelledby="overlay-title">
+    <div class="overlay-card">
+      <p class="eyebrow overlay-kicker">Chrome Dino 3D</p>
+      <h1 id="overlay-title">Ready when you are</h1>
+      <p id="overlay-sub">Space to jump, Down to duck. Drag to orbit the camera.</p>
+      <p class="overlay-score-line">
+        <span class="overlay-score mono">00000</span>
+        <span class="overlay-unit">m</span>
+      </p>
+      <div class="overlay-cta">
+        <button id="btn-start" class="cta" type="button">Start</button>
+        <button id="btn-restart" class="cta cta-secondary" type="button">Restart</button>
+      </div>
+      <p class="overlay-best">Best <span class="overlay-best-v mono">00000</span>
+        <span class="overlay-record badge">New best</span>
+      </p>
+    </div>
+  </div>
+
+  <!-- Frame counter and opt-in physics debug readout. -->
+  <div id="fps" aria-hidden="true">-- fps</div>
+  <div class="debug" aria-hidden="true"></div>
+
+</div>
+
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>
