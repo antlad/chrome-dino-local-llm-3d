@@ -37,11 +37,19 @@ export const STATE = {
 // different rate would be measuring an animal the player never plays.
 export const FIXED = 1 / 120;
 const MAX_FRAME = 0.1;          // never repay more than 100ms of lost time
-// A consequence of MAX_FRAME rather than a separate opinion: 0.1 s of backlog at
-// 1/120 is exactly 12 steps, and the extra couple are headroom for a frame that
-// lands just over the clamp. Hitting this cap means the tab is slower than about
-// 12 fps, at which point dropping time is the only sane answer.
-const MAX_SUBSTEPS = 14;
+// Derived from MAX_FRAME rather than chosen alongside it, because the two only make
+// sense together: 0.1 s of backlog at 1/120 is 12 steps, plus a couple for a frame that
+// lands just over the clamp and for whatever was left in the accumulator. Stated as a
+// multiple, so raising MAX_FRAME cannot silently turn this cap into the live limit.
+//
+// Worth being honest about what this guard is for. While MAX_FRAME holds, a frame can
+// reach at most 12 substeps, so this cap never fires and the backlog-drop below is
+// unreachable. It is not dead weight: it is what stands between a future edit to
+// MAX_FRAME and a simulation that tries to repay thirty seconds in one frame and hangs
+// the tab. The stall tests in smoke-check cover the pair of them, and they do catch it:
+// with both guards removed, real time never comes back after a starved tab and the game
+// runs in permanent slow motion.
+const MAX_SUBSTEPS = Math.ceil(MAX_FRAME / FIXED) + 2;
 const DEATH_DECAY = 3.6;        // how fast the corpse's forward speed bleeds off
 const SLOWMO_TIME = 0.32;
 const SLOWMO_SCALE = 0.34;

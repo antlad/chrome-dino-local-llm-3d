@@ -383,6 +383,25 @@ function pump(frames) {
   }
 }
 
+/**
+ * Deliver one frame after the tab was starved of frames for `gapMs`.
+ *
+ * A real browser stops calling requestAnimationFrame when a tab is hidden, so the frame
+ * that finally arrives carries a dt of seconds, not the 16ms the simulation is tuned
+ * for. Nothing else in this file produces that: every other pump steps the clock by one
+ * frame at a time. It is worth its own helper because the two failure modes it can
+ * expose are the expensive ones, both of which were found in Chrome rather than here.
+ * Fed a raw multi-second dt, an unclamped loop either repays the whole gap in one go
+ * (the animal teleports forward and dies) or, with the substep cap mis-set, silently
+ * runs in slow motion forever afterward.
+ */
+function pumpGap(gapMs, frames = 1) {
+  clock += gapMs;
+  const due = rafQueue.splice(0, rafQueue.length);
+  for (const fn of due) fn(clock);
+  pump(frames);
+}
+
 const errors = [];
 const realError = console.error;
 console.error = (...a) => { errors.push(a.map(String).join(' ')); };
@@ -508,6 +527,81 @@ for (const mode of ['chase', 'side', 'low', 'orbit', 'top', 'free']) {
 }
 api.setCameraMode('chase');
 pump(2);
+
+/**
+ * Tab stalls.
+ *
+ * These exist because all three of the bugs they would catch were found by driving the
+ * page in real Chrome, and none of them were visible to a test that only ever advances
+ * the clock one smooth frame at a time. A hidden tab stops delivering animation frames
+ * entirely, and main.js also releases every key on visibilitychange. Both are correct
+ * behaviour for a player who tabs away, and both are invisible unless something
+ * reproduces what the browser actually does to a backgrounded page.
+ */
+{
+  // Clear the field so the assertions below measure the loop rather than a collision
+  // that happened to be due.
+  const G = api.game;
+  const clearField = () => {
+    G.field.items.length = 0;
+    G.field._visible.length = 0;
+    G.field.frontier = G.dino.pelvis.x + 1e5;
+  };
+  clearField();
+
+  const before = G.distance;
+  pump(60);
+  const perSecond = (G.distance - before) / 1;   // 60 frames at 1/60s
+  check('run advances at real time before a stall', perSecond > 1,
+    `${perSecond.toFixed(2)} m/s`);
+
+  clearField();
+  const stallFrom = G.distance;
+  const hipBefore = G.dino.hipHeight;
+  pumpGap(30000);
+  const gained = G.distance - stallFrom;
+  check('a 30s background stall does not teleport the animal', gained < 1.2,
+    `gained ${gained.toFixed(2)} m`);
+  check('a 30s background stall does not kill it', G.state === 'playing', G.state);
+  check('the loop is still alive after the stall', !!G._raf, 'no pending frame');
+
+  // The subtler half: a substep cap that banks the backlog instead of dropping it makes
+  // every frame afterward try to catch up, so the game settles into permanent slow
+  // motion and never returns to real time. One frame proves nothing; this measures the
+  // sixty that follow.
+  clearField();
+  const afterFrom = G.distance;
+  pump(60);
+  const afterRate = (G.distance - afterFrom) / 1;
+  check('real time is restored after a stall, not permanently slowed',
+    Math.abs(afterRate - perSecond) / perSecond < 0.35,
+    `before ${perSecond.toFixed(2)} m/s, after ${afterRate.toFixed(2)} m/s`);
+  check('the gait survived the stall',
+    G.dino.hipHeight > 0.45 && G.dino.hipHeight < 1.3 && Number.isFinite(G.dino.hipHeight),
+    `hip ${hipBefore.toFixed(2)} -> ${G.dino.hipHeight.toFixed(2)}`);
+}
+
+// A hidden tab has to drop its held keys, or a player who tabs away while holding duck
+// comes back still crouching and with a buffered jump waiting to fire.
+{
+  fireWindow('keydown', { key: 'ArrowDown', code: 'ArrowDown' });
+  pump(30);
+  const ducked = api.game.dino.hipHeight < 0.72;
+  check('down is held and ducks before the hide', ducked,
+    `hip=${api.game.dino.hipHeight.toFixed(3)}`);
+
+  // `buildDom` keeps its doc local, but it is installed as globalThis.document, and
+  // main.js reads document.hidden rather than asking each time.
+  document.hidden = true;
+  fireWindow('visibilitychange', {});
+  document.hidden = false;
+  check('hiding the tab releases every key', api.input.held.size === 0,
+    `${api.input.held.size} still held`);
+  fireWindow('keyup', { key: 'ArrowDown', code: 'ArrowDown' });
+  pump(60);
+  check('the animal stands back up after a hidden-tab duck',
+    api.game.dino.hipHeight > 0.5, `hip=${api.game.dino.hipHeight.toFixed(3)}`);
+}
 
 // A forced collision has to end the run and reach the game-over card.
 api.game.die({ x: -3, y: 4, z: 0.3 });
