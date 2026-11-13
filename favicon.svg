@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Dino 3D">
+  <!--
+    The tab icon. Deliberately a file rather than a data URI: it is cacheable, it is
+    editable without touching index.html, and declaring rel="icon" is also what stops
+    Chrome making an automatic unasked-for request for /favicon.ico, which showed up in
+    the browser check as a 404 and was briefly mistaken for a real load failure.
+  -->
+  <rect width="64" height="64" rx="14" fill="#0b0e12"/>
+  <!-- ground line, so it reads as a runner rather than a floating lizard -->
+  <rect x="10" y="50" width="44" height="3" rx="1.5" fill="#2f3b4a"/>
+  <!-- body, tail, neck and head as one silhouette -->
+  <path d="M20 30
+           c0-6 4-10 10-11
+           l1-6 c0-2 2-3 4-3 h6
+           c2 0 3 1 3 3 v3 l4 2 c1 1 1 2 0 3 l-4 2
+           v6 c0 6-4 11-10 12 l1 7 h-4 l-2-7 -3 1 -1 6 h-4 l-1-7
+           c-4-2-6-6-6-11 z"
+        fill="#5ad1a5"/>
+  <!-- eye -->
+  <circle cx="38" cy="17" r="1.8" fill="#0b0e12"/>
+  <!-- obstacle, so the icon says runner and not just dinosaur -->
+  <path d="M14 50 v-9 m0 4 h-4 m4 1 h4" stroke="#e8b04b" stroke-width="2.6"
+        stroke-linecap="round" fill="none"/>
+</svg>
