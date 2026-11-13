@@ -201,8 +201,15 @@ export class WorldScene {
 
     this._propPools = new Map();
     this._active = []; // [{group, kind, seed}] rebuilt only when syncProps changes
-    this._dustVel = null;
-    this._dustPos = null;
+    // _dustPos, _dustVel and _dustCount are owned by _buildDust, which has already run
+    // by this point. The two nulls that used to sit here were written after the build
+    // and so overwrote the buffers it had just allocated: dust stayed invisible while
+    // speed was low, and the first frame that crossed the fade threshold read index 0
+    // of null. Anything that resets these has to reset them together, and with a
+    // count, or the loop and the buffer disagree about how many particles there are.
+    this._dustTargetSpeed = 4;
+    this._dustBaseOpacity = 0.5;
+    this._dustSpeed = 0;
     this._applyQuality(this._T);
   }
 
@@ -497,6 +504,9 @@ export class WorldScene {
       metalness: 0,
       map: this._farTex,
     });
+    // Same reason as _duneMat: _applyDaylight tints the far strip with the rest of the
+    // desert, and it cannot do that to a material nothing holds a reference to.
+    this._farMat = farMat;
     this.farGround = new T.Mesh(farGeo, farMat);
     this.farGround.position.set(0, -0.02, -26);
     this.groundGroup.add(this.farGround);
@@ -505,6 +515,10 @@ export class WorldScene {
     this.dunes = new T.Group();
     this.dunes.name = 'dunes';
     const duneMat = new T.MeshLambertMaterial({ color: '#cbb58c', flatShading: true });
+    // Kept on the instance because _applyDaylight repaints it. A local here left
+    // _duneMat undefined and the first frame threw, which is the kind of bug that only
+    // surfaces once the world is actually driven, not while it is being built.
+    this._duneMat = duneMat;
     const DUNE_ROWS = 2;
     const DUNE_COLS = 6;
     for (let row = 0; row < DUNE_ROWS; row++) {
@@ -685,7 +699,10 @@ export class WorldScene {
     this.scene.fog.color.copy(c.fog);
 
     this.sun.color.copy(c.sun);
-    this.sun.intensity = c.sun;
+    // sunI is the number in the palette and sun is the Color. Assigning the Color to
+    // intensity made the light permanently black, because three coerces a non-number to
+    // zero, so the whole scene lost its key light and only the ambient survived.
+    this.sun.intensity = c.sunI;
     this.hemi.color.copy(c.hemiSky);
     this.hemi.groundColor.copy(c.hemiGround);
     this.hemi.intensity = c.hemiI;
@@ -798,13 +815,16 @@ export class WorldScene {
       if (pos[b] < -16 || pos[b + 1] < 0.02) {
         // Recycle rather than respawn: reusing the slot keeps the buffer hot and
         // the particle count constant, which is what keeps this allocation-free.
-        const r = this._rand();
-        pos[b] = 5 + r() * 7;
-        pos[b + 1] = 0.15 + r() * 2.4;
-        pos[b + 2] = (r() - 0.5) * 6.5;
+        // _rand is a method returning a number, not a factory returning a generator,
+        // so each draw is its own call. It was written as `const r = this._rand()` and
+        // then `r()`, which threw the first time any particle fell far enough to need
+        // recycling: a crash on a path only taken a few seconds into a fast run.
+        pos[b] = 5 + this._rand() * 7;
+        pos[b + 1] = 0.15 + this._rand() * 2.4;
+        pos[b + 2] = (this._rand() - 0.5) * 6.5;
         vel[b] = -this._dustTargetSpeed * 0.6;
-        vel[b + 1] = 0.4 + r() * 1.4;
-        vel[b + 2] = (r() - 0.5) * 0.6;
+        vel[b + 1] = 0.4 + this._rand() * 1.4;
+        vel[b + 2] = (this._rand() - 0.5) * 0.6;
       }
     }
     this._dustTargetSpeed = 4 + speedNorm * 26;

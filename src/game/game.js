@@ -80,7 +80,7 @@ export class Game {
     this._view = { pos: { x: 0, y: 0.92, z: 0 }, height: 0.92, vel: { x: 0, y: 0, z: 0 } };
 
     if (this.input) {
-      this.input.onCanvasTap = () => this._advance();
+      this.input.onCanvasTap = () => this.advance();
     }
   }
 
@@ -92,16 +92,56 @@ export class Game {
     this.setState(STATE.MENU);
   }
 
+  /**
+   * The one place the HUD's overlays are driven.
+   *
+   * The HUD does not have a setState, and it should not: it is a projection of a
+   * context object, and the two panels it owns are not states, they are two
+   * separately-shaped things that happen to be triggered by states. So the
+   * transitions are spelled out here rather than forwarded and hoped for. An
+   * earlier version called hud.setState on every transition and nothing happened,
+   * because that method does not exist, which meant the game ran forever with no
+   * menu and no game-over panel and no error anywhere to say so.
+   */
   setState(next) {
     if (this.state === next) return;
     this.state = next;
     this.paused = next === STATE.PAUSED;
     if (this.input) this.input.blocked = next === STATE.PAUSED || next === STATE.LOADING;
-    this.hud?.setState?.(next);
+
+    const hud = this.hud;
+    if (!hud) return;
+    switch (next) {
+      case STATE.MENU:
+        hud.showMenu?.({ best: this.best, score: this.score });
+        hud.setPaused?.(false);
+        break;
+      case STATE.PLAYING:
+        hud.hideGameOver?.();
+        hud.setPaused?.(false);
+        break;
+      case STATE.GAMEOVER:
+        hud.showGameOver?.({
+          score: this.score,
+          best: this.best,
+          isRecord: this.score > 0 && this.score >= this.best,
+        });
+        break;
+      case STATE.PAUSED:
+        hud.setPaused?.(true);
+        break;
+      default:
+        // LOADING and DYING own no chrome of their own.
+        break;
+    }
   }
 
-  /** Space / tap / Enter: do the only thing that makes sense for this state. */
-  _advance() {
+  /**
+   * Space / tap / Enter: do the only thing that makes sense for this state.
+   * Public because the shell, the canvas tap and the keyboard all mean the same
+   * gesture here, and none of them should have to guess whether a start is legal.
+   */
+  advance() {
     switch (this.state) {
       case STATE.MENU:
         this.start();
@@ -139,9 +179,12 @@ export class Game {
     this.isNight = false;
     this._acc = 0;
     this._lastTime = 0;
-    this.camera?.reset?.('chase');
+    // A new run starts from the shell's default lens, not wherever the player had
+    // dragged it. resetView clears the user's orbital offsets and setMode returns to
+    // the chase pose; the camera has no single reset that does both.
+    this.camera?.resetView?.();
+    this.camera?.setMode?.('chase');
     this.setState(STATE.PLAYING);
-    this.hud?.onStart?.();
   }
 
   restart() {
@@ -172,8 +215,10 @@ export class Game {
     this.deathTimer = 0;
     this.slowmo = SLOWMO_TIME;
     this.hitFlash = 1;
-    this.hud?.flashHit?.();
-    this.hud?.onDeath?.();
+    // The screen flash is the HUD's own job: hitFlash is carried in the context
+    // every frame and the HUD ramps a vignette off it. This is the one-shot text
+    // tag over the top, which is a different thing and needs its own call.
+    this.hud?.flash?.('Wiped out', 'bad');
     this.setState(STATE.DYING);
   }
 
@@ -353,7 +398,9 @@ export class Game {
     this.cleared = this.field.countPassed(pelvis.x);
 
     if (!checkHits) return;
-    const hit = this.field.checkHit(this.dino.bounds());
+    // hitBounds, not bounds: the tail is decorative and must not end a run. See
+    // DinoRagdoll.hitBounds for the two ways a whole-body box lies about contact.
+    const hit = this.field.checkHit(this.dino.hitBounds());
     if (hit) {
       // Knockback opposes the obstacle's motion and shoves the dino off its
       // centre line, so the corpse tumbles away from the thing that killed it.
@@ -389,16 +436,23 @@ export class Game {
 
   _updateCamera(dt) {
     const view = this._view;
-    const cameraEyeY = this.camera?.eyeHeight?.() ?? 3;
+    const speedNorm = clamp(this.speed / CONFIG.maxSpeed, 0, 1);
+    // The rig poses itself from speedNorm, not speed: it is a 0..1 fraction of the
+    // difficulty ceiling and the whole feel curve is authored in those terms. Read
+    // the eye height off the camera it owns rather than asking for a method that
+    // does not exist, because the world uses that number to place its fog.
+    const cameraEyeY = this.camera?.camera?.position?.y ?? 3;
     this.camera?.update?.(dt, {
       dino: view,
       velocity: view.vel,
       speed: this.state === STATE.PLAYING ? this.speed : Math.abs(view.vel.x),
+      speedNorm,
       distance: this.distance,
       state: this.state,
       strafe: this.input?.strafeAxis?.() ?? 0,
       grounded: this.dino.grounded,
       hipHeight: this.dino.hipHeight,
+      hitFlash: this.hitFlash,
     });
     this._cameraEyeY = cameraEyeY;
   }
@@ -430,14 +484,25 @@ export class Game {
     view.vel.y = v[1];
     view.vel.z = v[2];
     view.height = Math.max(0, this.dino.clearance());
+    // The rig and the world both read these off the same view object. `world` lets
+    // the camera find the head particle, `heading` is the lean into a lane change.
+    view.world = this.dino.world;
+    view.heading = this.dino.heading;
 
-    this.dinoMesh?.sync?.(this.dino);
+    const speedNorm = clamp(this.speed / CONFIG.maxSpeed, 0, 1);
+
+    // The mesh reads the solver straight out of the world it was built against, so
+    // there is nothing to hand it beyond the ctx it wants. What does have to be
+    // pushed is limpness: the body goes slack as the death motors fade, and the
+    // mesh has no idea the animal died unless it is told.
+    this.dinoMesh?.setLimp?.(1 - this.dino.motor);
+    this.dinoMesh?.update?.();
 
     const ctx = this._ctx;
     ctx.dino = view;
     ctx.camera = this.camera?.camera ?? null;
     ctx.speed = this.speed;
-    ctx.speedNorm = clamp(this.speed / CONFIG.maxSpeed, 0, 1);
+    ctx.speedNorm = speedNorm;
     ctx.timeOfDay = this.timeOfDay;
     ctx.isNight = this.isNight;
     ctx.cameraEyeY = this._cameraEyeY ?? 3;
@@ -450,20 +515,25 @@ export class Game {
     if (this.milestonePulse > 0) this.milestonePulse = Math.max(0, this.milestonePulse - dt * 2);
 
     if (this.hud) {
-      this.hud.update?.(dt, {
+      // The HUD takes one context for the readouts and one for the chrome it owns,
+      // so a state change cannot desync a checkbox from what is actually on.
+      this.hud.sync?.({
         score: this.score,
         best: this.best,
         distance: this.distance,
         speed: this.speed,
-        speedNorm: ctx.speedNorm,
+        speedNorm,
         state: this.state,
-        cameraMode: this.camera?.mode ?? 'chase',
         timeOfDay: this.timeOfDay,
         isNight: this.isNight,
         fps: this.fps,
         cleared: this.cleared,
         hitFlash: this.hitFlash,
+        milestone: this.milestonePulse > 0 ? 1 : 0,
         grounded: this.dino.grounded,
+        heading: this.dino.heading,
+      }, {
+        cameraMode: this.camera?.mode ?? 'chase',
         quality: this.quality,
       });
       if (this.hitFlash > 0) this.hitFlash = Math.max(0, this.hitFlash - dt * 3.2);

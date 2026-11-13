@@ -17,10 +17,17 @@ export const CONFIG = {
   lanes: [-0.28, 0, 0.28],  // the dino drifts a little side to side while running
 
   // --- running ---------------------------------------------------------
-  baseSpeed: 2.2,          // m/s at the start of a run
+  // baseSpeed is a fairness constraint, not a feel preference. Clearing a prop
+  // means keeping the whole hit box above it for (bodyLength + propWidth) / speed,
+  // and the animal's hit box is 1.35 m long. At 2.2 m/s that is over half a
+  // second spent above the obstacle, which no arc that still looks like a jump
+  // can supply, so the slowest run in the game was the one where props were
+  // literally impossible. The floor is set where the measured arcs leave real
+  // margin, which is around 3 m/s.
+  baseSpeed: 3.0,          // m/s at the start of a run
   maxSpeed: 5.4,           // m/s at full difficulty; see the note above
   accelPerMetre: 0.0055,   // m/s gained per metre travelled, ramps the difficulty
-  startSpeed: 2.2,         // legacy aliases kept so older call sites stay honest
+  startSpeed: 3.0,         // legacy aliases kept so older call sites stay honest
   accel: 0.055,
   deathDecay: 6.5,         // how fast the world stops after a hit (m/s^2)
 
@@ -30,7 +37,24 @@ export const CONFIG = {
   laneSpeed: 1.5,          // m/s of lateral drift for held strafe keys
 
   // --- jump ------------------------------------------------------------
-  jumpVelocity: 6.1,       // 2*v/|g| = 0.51 s of airtime, 1.55 m of height
+  // The body arc and the solver use different gravity, on purpose. The legs are
+  // solved against `gravity` (-24), which is what makes a footfall snap down and
+  // the gait hold its cadence. The root's leap is integrated against
+  // `jumpGravity`, which is gentler. That separation is what makes the game
+  // playable: hang time has to be long enough for the body to actually travel
+  // past an obstacle, and hang time is only reachable at low gravity (height =
+  // g*T^2/8, so a long arc does not have to be a tall one). Dropping the global
+  // gravity to get a floaty jump instead made the limbs drift and the run
+  // collapse, so only the arc gets the gentler pull.
+  // jumpVelocity and jumpGravity were solved against a measured clearance
+  // budget, not picked for feel: for every obstacle kind, at both the starting
+  // speed and the top speed, the arc has to keep the hit box above the prop's top
+  // for longer than (body length + prop width) / speed with margin. That test is
+  // what `test/obstacle-check.mjs` re-runs, so these cannot silently drift out of
+  // the clearable region again. Hang is ~1.2 s for a ~1.1 m rise, which reads as
+  // a heavy animal getting airborne rather than a floaty arcade hop.
+  jumpVelocity: 3.6,
+  jumpGravity: -5.8,       // m/s^2 on the root while airborne
   jumpCutMultiplier: 0.44, // releasing jump early cuts the rise (feels tight)
   coyoteTime: 0.09,
   jumpBuffer: 0.11,
@@ -46,8 +70,21 @@ export const CONFIG = {
   // commanded speed. Keep maxSpeed under 2 * strideLength * strideCadence or the
   // anchors start sliding and the run turns into a water-ski.
   standHeight: 0.70,
-  duckHeight: 0.46,
+  // The crouch is a gameplay guarantee, not a pose preference. The flyers are
+  // authored so that standing hits them and crouching does not, which means the
+  // crouched hit box has to be comfortably below their bellies. Measured against
+  // test/obstacle-check.mjs: at 0.46 the crouched box peaked at 1.00 m, which is
+  // above every flyer's underside and made ducking useless. See AXIAL in dino.js,
+  // where the head and snout fold with it.
+  duckHeight: 0.40,
   swingHeight: 0.16,       // how high a swinging foot clears the sand
+  // During a committed leap the feet are pulled up under the body rather than
+  // reaching for the ground. Without this the swing solver drives the toes toward
+  // a *world* height near the sand while the hip is at 1.4 m, so the legs hang
+  // straight down to 0.38 m and the body's lowest point is below every obstacle's
+  // top: no obstacle in the game could be jumped. These are hip-relative.
+  airTuck: 0.30,           // m below the hip a tucked foot is held at
+  airReach: 0.14,          // m ahead of the hip a tucked foot sits
   supportBlend: 16,        // 1/s: how fast the hip climbs onto the support leg
   forwardBlend: 10,        // 1/s: how hard the planted leg drags the body along
   maxAccel: 26,            // m/s^2: the most the root may chase the commanded speed

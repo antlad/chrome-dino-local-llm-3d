@@ -20,14 +20,31 @@
 import { CONFIG, clamp } from './config.js';
 
 /** kind -> shape. y is the centre of the box above the ground plane. */
+// Sizes are constrained by the animal, not by taste. The hit box is 1.35 m long,
+// and a jump has to keep that whole box above a prop's top for
+// (bodyLength + propWidth) / speed. Two props broke that budget outright: the
+// cluster at 1.55 m was *wider than the dinosaur*, so it could never be cleared
+// horizontally no matter how the jump was timed, and the tall cactus at 1.18 m
+// stood taller than the animal's back, so it needed an apex the body could not
+// reach. Both now sit inside the measured clearance budget that
+// `test/obstacle-check.mjs` enforces against jumpVelocity and jumpGravity.
+// Flyer heights are set by the crouch, not by taste. The measured envelopes are a
+// standing top of 1.36 m and a crouched top of 0.87 m, so a duckable flyer's belly has
+// to sit above 0.87 m in the worst case, and its top has to stay within reach of the
+// standing body or it is scenery rather than a question. Worst case is not the nominal
+// spec: _spawn scales y down to 0.96, h up to 1.1, and the bob adds a further 0.12 m of
+// dip, so the belly lands about 0.15 m below where the numbers below appear to put it.
+// That is what the heights are solved against, and `test/obstacle-check.mjs` recomputes
+// the whole thing from the ragdoll and this table. Anything lower than the crouch is a
+// second jump question (pterodactyl-low, cleared by hopping), not a duck.
 const KINDS = {
-  'cactus-small':   { w: 0.52, h: 0.66, d: 0.52, y: null, ground: true,  weight: 26 },
-  'cactus-tall':    { w: 0.58, h: 1.18, d: 0.58, y: null, ground: true,  weight: 16 },
-  'cactus-cluster': { w: 1.55, h: 0.82, d: 1.15, y: null, ground: true,  weight: 12 },
-  'rock':           { w: 0.86, h: 0.46, d: 0.82, y: null, ground: true,  weight: 18 },
-  'pterodactyl-high': { w: 1.15, h: 0.58, d: 1.05, y: 1.22, ground: false, weight: 14, vx: -0.7, fly: true },
+  'cactus-small':   { w: 0.50, h: 0.60, d: 0.50, y: null, ground: true,  weight: 26 },
+  'cactus-tall':    { w: 0.55, h: 1.00, d: 0.55, y: null, ground: true,  weight: 16 },
+  'cactus-cluster': { w: 1.10, h: 0.74, d: 0.95, y: null, ground: true,  weight: 12 },
+  'rock':           { w: 0.78, h: 0.42, d: 0.74, y: null, ground: true,  weight: 18 },
+  'pterodactyl-high': { w: 1.15, h: 0.58, d: 1.05, y: 1.24, ground: false, weight: 14, vx: -0.7, fly: true },
   'pterodactyl-low':  { w: 1.10, h: 0.50, d: 1.00, y: 0.30, ground: false, weight: 12, vx: -0.4, fly: true },
-  'bird':             { w: 0.78, h: 0.40, d: 0.92, y: 0.97, ground: false, weight: 10, vx: -1.5, fly: true },
+  'bird':             { w: 0.78, h: 0.40, d: 0.92, y: 1.15, ground: false, weight: 10, vx: -1.5, fly: true },
 };
 
 /** Kinds that unlock with distance, so the first hundred metres are only hops. */
@@ -92,15 +109,35 @@ export class ObstacleField {
     this.passed = 0;
   }
 
-  /** Airtime of the designed jump, used to keep pairs clearable. */
+  /**
+   * Airtime of the designed jump, used to keep pairs clearable.
+   *
+   * This has to be the *real* arc, not the one the solver's gravity implies. The
+   * root's leap is integrated against `jumpGravity`, which is gentler than the
+   * `-24` the limb solver runs on (see the note in the config), so reading
+   * `gravity` here reported 0.53 s for an arc that actually lasts 0.88 s. Every
+   * gap downstream of this number was then derived from the wrong number: the
+   * field laid obstacles at the distance a dino covers in half a second when it
+   * needs nearly a full second, which is precisely the "wall that cannot be
+   * jumped" failure this spacing rule exists to prevent.
+   */
   get airtime() {
-    return (2 * this.cfg.jumpVelocity) / Math.abs(this.cfg.gravity);
+    return (2 * this.cfg.jumpVelocity) / Math.abs(this.cfg.jumpGravity ?? this.cfg.gravity);
   }
 
-  /** Room a pair needs so the second obstacle is reachable after the first. */
+  /**
+   * Room a pair needs so the second obstacle is reachable after the first.
+   *
+   * The floor and ceiling are not arbitrary: `minGap` has to clear a full jump
+   * (arc distance, plus the body length, plus the moment to re-plant the legs and
+   * push off again). If the arc grows without the floor growing with it, the clamp
+   * silently pins the gap back down to something unclearable, so the floor is
+   * derived from the arc rather than being an independent constant.
+   */
   minGapFor(speed) {
     const land = this.airtime * speed;
-    return clamp(land + 1.4, this.cfg.minGap, this.cfg.maxGap);
+    const needed = land + 2.0;
+    return clamp(Math.max(needed, this.cfg.minGap), this.cfg.minGap, this.cfg.maxGap);
   }
 
   _spawn(x, distance) {
@@ -110,9 +147,22 @@ export class ObstacleField {
     this.lastKind = kind;
     const spec = KINDS[kind];
     const w = spec.w * (0.88 + this.rand() * 0.26);
-    const h = spec.h * (0.9 + this.rand() * 0.2);
     const d = spec.d * (0.9 + this.rand() * 0.2);
-    const y = spec.ground ? h / 2 : spec.y * (0.96 + this.rand() * 0.08);
+    // Flyers are jittered far less than ground props, and the reason is fairness
+    // rather than taste. A duckable flyer's belly has to stay above the crouch and
+    // below the standing head bob, and those two are only about 0.22 m apart. The
+    // ground-prop jitter of +-4 % on y, +10 % on h and a 0.12 m bob swings a belly by
+    // 0.31 m on its own, which is more than the whole window: the same prop would be
+    // duckable on one roll and lethal on the next, and the player has no way to tell
+    // which before committing to the key. Ground props only have to clear the sand, so
+    // they can keep their variety. The draw order is identical on both branches so the
+    // sequence stays the same regardless of which kind was picked.
+    const hy = this.rand();
+    const hyi = this.rand();
+    const h = spec.h * (spec.fly ? 0.97 + hy * 0.06 : 0.9 + hy * 0.2);
+    const y = spec.ground
+      ? h / 2
+      : spec.y * (spec.fly ? 0.99 + hyi * 0.02 : 0.96 + hyi * 0.08);
     // Ground props hug the running line; flyers get a little lateral wander so a
     // flock never looks like a stencil.
     const laneSpread = spec.ground ? 0.16 : 0.3;
@@ -127,7 +177,7 @@ export class ObstacleField {
       dead: false,
       passed: false,
       bobPhase: this.rand() * Math.PI * 2,
-      bobAmp: spec.fly ? 0.05 + this.rand() * 0.07 : 0,
+      bobAmp: spec.fly ? 0.015 + this.rand() * 0.01 : 0,
       baseY: y,
     };
     this.items.push(item);

@@ -112,9 +112,26 @@ export class Input {
 
   // ------------------------------------------------------------------ keys
 
+  /**
+   * Resolve a key event to an action name.
+   *
+   * Both tables are keyed in lowercase, but `KeyboardEvent.code` is *not* lowercase:
+   * it is 'Space', 'KeyP', 'Digit2'. Looking an unmodified code up in a lowercase table
+   * matched nothing, which meant every code-keyed action was dead on arrival: no jump
+   * on Space, no pause on P, no restart on R, no camera on the number row. The keys
+   * that worked did so because their `key` value was already lowercase, which is
+   * precisely why the failure was invisible during development of any one of them.
+   * Lowercasing the code once, here, is the fix; the tables stay as written.
+   */
   _actionFor(ev) {
     const key = String(ev.key || '').toLowerCase();
-    return KEY_MAP[key] || KEY_MAP[ev.code] || null;
+    const code = String(ev.code || '').toLowerCase();
+    return KEY_MAP[key] || KEY_MAP[code] || null;
+  }
+
+  /** Same normalisation for the camera-mode row, which is keyed by code alone. */
+  _cameraModeFor(ev) {
+    return CAMERA_MODE_KEYS[String(ev.code || '').toLowerCase()] || null;
   }
 
   _keyDown(ev) {
@@ -125,7 +142,7 @@ export class Input {
     const isUI = ev.target && ev.target.matches && ev.target.matches(
       'input, select, textarea, button, [contenteditable]',
     );
-    const mode = CAMERA_MODE_KEYS[ev.code];
+    const mode = this._cameraModeFor(ev);
     if (mode) {
       if (isUI) return;
       ev.preventDefault();
@@ -147,10 +164,17 @@ export class Input {
       this.jumpBuffer = this.jumpBufferTime;
       this.jumpWasPressed = true;
     }
-    if (action === 'start') this.onAction('start');
-    if (action === 'restart') this.onAction('restart');
-    if (action === 'pause') this.onAction('pause');
-    this.onAction('keydown', action);
+    // Exactly one report per keypress.
+    //
+    // This used to fire onAction(action) for the four keys it treats as gestures and
+    // *additionally* onAction('keydown', action) for every recognised key, on the theory
+    // that a listener might want to know a key was pressed at all. Nothing wanted that,
+    // and the cost was severe: a listener switching on the action name saw one keypress
+    // as two events, so P paused and immediately resumed itself, and any listener that
+    // only read the first argument silently lost C, V and N, which are not gestures and
+    // so only ever arrived on the second channel. Both halves of that bug are invisible
+    // while testing either key alone. A device layer reports decisions once.
+    this.onAction(action);
   }
 
   _keyUp(ev) {

@@ -75,6 +75,13 @@ export const SKELETON = {
 const ORDER = Object.keys(SKELETON);
 const SIDES = ['L', 'R'];
 
+/**
+ * Particles left out of the collision box. See `hitBounds` for why the tail is
+ * not allowed to kill the player. The arms stay in: they are at the front, and a
+ * run should end if the dino's chest hits something.
+ */
+const HIT_EXCLUDE = new Set(['tail1', 'tail2', 'tail3', 'tail4']);
+
 /** Bones rendered as tapered capsules: [from, to, radiusAtFrom, radiusAtTo]. */
 export const BONES = [
   ['pelvis', 'chest', 0.150, 0.145],
@@ -161,10 +168,10 @@ const JOINT_BY_NAME = new Map(JOINTS.map((j) => [j.name, j]));
  * and the tail tip, which are light and want to lag, are allowed to be softer.
  */
 const AXIAL = {
-  chest: { support: 0.95, tau: 0.06, duckOffset: 0.045 },
-  neck: { support: 0.93, tau: 0.06, duckOffset: 0.055 },
-  head: { support: 0.88, tau: 0.07, duckOffset: 0.030 },
-  snout: { support: 0.82, tau: 0.08, duckOffset: -0.020 },
+  chest: { support: 0.95, tau: 0.06, duckOffset: -0.020 },
+  neck: { support: 0.93, tau: 0.06, duckOffset: -0.030 },
+  head: { support: 0.88, tau: 0.07, duckOffset: -0.070 },
+  snout: { support: 0.82, tau: 0.08, duckOffset: -0.140 },
   tail1: { support: 0.94, tau: 0.06, duckOffset: -0.070 },
   tail2: { support: 0.90, tau: 0.07, duckOffset: -0.150 },
   tail3: { support: 0.86, tau: 0.075, duckOffset: -0.240 },
@@ -357,9 +364,34 @@ export class DinoRagdoll {
 
   /** Rough AABB, used for obstacle hits. */
   bounds() {
+    return this._bounds(null);
+  }
+
+  /**
+   * The box collisions are actually tested against: the body with the tail left
+   * out.
+   *
+   * The tail is a metre of trailing decorative geometry, and it is the single
+   * biggest source of false deaths. Two ways it lies. Its tip drags on the sand,
+   * so a whole-body AABB has a floor near zero even mid-jump, which meant the
+   * animal could never get its lowest point above a cactus no matter how well it
+   * timed the leap. And its length stretches the box to two metres, so an
+   * obstacle stayed "overlapping" for almost twice as long as the animal was really
+   * there, long enough that the jump came down onto it. Neither is a thing that
+   * should end a run: the tail never leads the animal forward, so nothing can be
+   * hit tail-first in normal play. The comment on `checkHit` already conceded that
+   * "losing a run because a tail brushed a cactus reads as unfair, not physical";
+   * this is that concession taken seriously rather than padded by 5 cm.
+   */
+  hitBounds() {
+    return this._bounds(HIT_EXCLUDE);
+  }
+
+  _bounds(exclude) {
     const w = this.world;
     const o = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity, minZ: Infinity, maxZ: -Infinity };
     for (let p = 0; p < w.count; p++) {
+      if (exclude && exclude.has(w.names[p])) continue;
       const b = p * 3, r = w.radius[p];
       if (w.pos[b] - r < o.minX) o.minX = w.pos[b] - r;
       if (w.pos[b] + r > o.maxX) o.maxX = w.pos[b] + r;
@@ -418,6 +450,9 @@ export class DinoRagdoll {
     // frame, because the gait plants a foot on frame one and the cancellation fires
     // on contact. Starting above the grace window is what makes the arc survive.
     this.airTime = this.cfg.jumpGrace + 0.06;
+    // Marks this flight as a committed leap rather than the running hop, so the
+    // root uses the gentle arc gravity and the legs tuck. Cleared on landing.
+    this._jumping = true;
     for (let p = 0; p < w.count; p++) {
       if (w.inv[p] === 0 || p === this.i.pelvis) continue;
       const cur = w.getVelocity(p, 1 / 60, w.substeps);
@@ -592,13 +627,23 @@ export class DinoRagdoll {
     // decides the shape of the arc and the landing is whatever the arc arrives at.
     const floor = ducking ? this.cfg.duckHeight : this.cfg.standHeight;
     if (this.airTime > 0) {
-      this.rootVy += this.cfg.gravity * dt;
+      // The arc is integrated against its own gravity, not the solver's, but only
+      // for a committed leap. See the note on `jumpGravity` in the config: a body
+      // launched at -24 is back on the sand before it has travelled a body length,
+      // which leaves nothing to jump over. The little flight phase between
+      // footsteps is *not* that case. It is a hop of a few centimetres, and it is
+      // supposed to snap back down; giving it the gentle arc turned the run into a
+      // series of floaty bounds and lifted the standing hip by 20 cm. So the two
+      // share `airTime` but not `gravity`.
+      const gArc = this._jumping ? this.cfg.jumpGravity : this.cfg.gravity;
+      this.rootVy += gArc * dt;
       this.rootY += this.rootVy * dt;
       if (this.rootY <= floor && this.rootVy < 0) {
         this.lastFallSpeed = this.rootVy;
         this.rootY = floor;
         this.rootVy = 0;
         this.airTime = 0;
+        this._jumping = false;
       }
     } else {
       // A running body is not a rigid one. The hip dips through mid-stance and
@@ -685,7 +730,7 @@ export class DinoRagdoll {
       const wantY = ry + lerp(SKELETON[name].y, spec.duckOffset, k);
 
       const gain = 1 / Math.max(spec.tau, 1e-3);
-      const kBlend = clamp(dt / Math.max(spec.tau, 1e-3), 0, 1);
+      const ks = clamp(dt / Math.max(spec.tau, 1e-3), 0, 0.5);
       const cur = w.getVelocity(i, 1 / 60, w.substeps);
       const weight = -this.cfg.gravity * spec.support * dt;
 
@@ -693,11 +738,25 @@ export class DinoRagdoll {
       const offVelY = clamp((wantY - w.pos[b + 1]) * gain, -cap, cap);
       const offVelZ = clamp((rz + SKELETON[name].z - w.pos[b + 2]) * gain, -cap, cap);
 
+      // The blend is a velocity lerp toward `hipVel + offset/tau`, which is a first
+      // order lag, not a true second order spring. It was rewritten as a critically
+      // damped spring (`v(1 - 2k) + k*offVel + 2k*hipV`) on the theory that the chain
+      // was underdamped and ringing the snout up through the crouch. That turned out
+      // to be the wrong diagnosis and a worse fix. The ring was already gone once the
+      // hip velocity was carried into the target (above), and the critical form, which
+      // reaches into the solver with a stiffer second order term, drove the pinned-foot
+      // legs past their bone constraint: `shinR-footR` stretched to 55 % because a
+      // pinned foot cannot be pulled back by the solver, so the stretch has nowhere to
+      // go but the distance joint. The lag below settles the crouch 0.3 m higher but
+      // keeps the skeleton one piece, which is the trade that has to be made. Flyer
+      // heights are authored against the measured crouch top this produces
+      // (test/obstacle-check.mjs), not the other way round.
+      const hipVelY = hipVel[1];
       w.setVelocity(
         i,
-        lerp(cur[0], clamp(hipVel[0] + offVelX, -cap, cap), kBlend),
-        lerp(cur[1], clamp(hipVel[1] + offVelY, -cap, cap), kBlend) + weight,
-        lerp(cur[2], clamp(hipVel[2] + offVelZ, -cap, cap), kBlend),
+        lerp(cur[0], clamp(hipVel[0] + offVelX, -cap, cap), ks),
+        lerp(cur[1], clamp(hipVel[1] + offVelY, -cap, cap), ks) + weight,
+        lerp(cur[2], clamp(hipVel[2] + offVelZ, -cap, cap), ks),
         1 / 60, w.substeps,
       );
     }
@@ -879,13 +938,40 @@ export class DinoRagdoll {
       // Swing. Track a point that moves from behind the hip to in front of it, so
       // the foot is always arriving and never waiting for the body to catch up.
       const swingDur = Math.max(0.045, this.swingDuration(speed));
-      this.swingClock[side] += dt;
-      const t = clamp(this.swingClock[side] / swingDur, 0, 1);
-      this.swingT[side] = t;
-      const reach = this.plantReach(speed);
-      const targetX = px + lerp(-this.cfg.maxReach * 0.55, reach, easeOut(t));
-      const lift = this.cfg.swingHeight * (air ? 1.6 : 1) * Math.sin(Math.PI * clamp(t * 1.05, 0, 1));
-      const targetY = r + Math.max(0.015, lift);
+      // `t` is read by the touchdown test below, so it has to live outside the
+      // branch that computes it. While airborne the clock is deliberately not
+      // advanced, which parks the swing where it was and lets it resume on landing
+      // rather than restarting its arc from the top.
+      let t = this.swingT[side];
+      let targetX;
+      let targetY;
+      if (air) {
+        // Committed leap: tuck the legs up under the body.
+        //
+        // The running swing places the foot at a *world* height just above the
+        // sand, which is correct when the hip is at standHeight and the leg needs
+        // to reach down. During a jump the hip climbs to about 1.4 m while that
+        // same target stays near the ground, so the IK pulls the leg straight down
+        // to 0.38 m. The animal's lowest point was then below the top of every
+        // obstacle in KINDS (the shortest, a rock, tops out at 0.46 m), which made
+        // the game literally un-winnable by jumping: the pelvis sailed over the
+        // cactus at 1.4 m and the dangling foot knocked it over anyway. A tuck is
+        // hip-relative, so as the body rises the feet rise with it. This is the
+        // single change that turns obstacles from walls into hurdles.
+        targetX = px + this.cfg.airReach;
+        // Floor the target a little below the hip rather than right at it, so the
+        // knee has somewhere to go. The IK cannot fold a leg into a point, and a
+        // target at the hip makes it solve for a nearly straight leg hanging down.
+        targetY = Math.max(r, py - this.cfg.airTuck);
+      } else {
+        this.swingClock[side] += dt;
+        t = clamp(this.swingClock[side] / swingDur, 0, 1);
+        this.swingT[side] = t;
+        const reach = this.plantReach(speed);
+        targetX = px + lerp(-this.cfg.maxReach * 0.55, reach, easeOut(t));
+        const lift = this.cfg.swingHeight * Math.sin(Math.PI * clamp(t * 1.05, 0, 1));
+        targetY = r + Math.max(0.015, lift);
+      }
 
       this.solveLeg(px, py, pz, targetX, targetY, laneZ, this.cfg.kneeBias, out);
       // The foot leads, the knee follows it. Servoing the foot first and the knee
