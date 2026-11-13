@@ -169,9 +169,9 @@ const JOINT_BY_NAME = new Map(JOINTS.map((j) => [j.name, j]));
  */
 const AXIAL = {
   chest: { support: 0.95, tau: 0.06, duckOffset: -0.020 },
-  neck: { support: 0.93, tau: 0.06, duckOffset: -0.030 },
-  head: { support: 0.88, tau: 0.07, duckOffset: -0.070 },
-  snout: { support: 0.82, tau: 0.08, duckOffset: -0.140 },
+  neck: { support: 0.93, tau: 0.06, duckOffset: -0.030, whipDamp: 0.8 },
+  head: { support: 0.88, tau: 0.07, duckOffset: -0.070, whipDamp: 0.8 },
+  snout: { support: 0.82, tau: 0.08, duckOffset: -0.140, whipDamp: 0.8 },
   tail1: { support: 0.94, tau: 0.06, duckOffset: -0.070 },
   tail2: { support: 0.90, tau: 0.07, duckOffset: -0.150 },
   tail3: { support: 0.86, tau: 0.075, duckOffset: -0.240 },
@@ -742,20 +742,32 @@ export class DinoRagdoll {
       // order lag, not a true second order spring. It was rewritten as a critically
       // damped spring (`v(1 - 2k) + k*offVel + 2k*hipV`) on the theory that the chain
       // was underdamped and ringing the snout up through the crouch. That turned out
-      // to be the wrong diagnosis and a worse fix. The ring was already gone once the
-      // hip velocity was carried into the target (above), and the critical form, which
-      // reaches into the solver with a stiffer second order term, drove the pinned-foot
-      // legs past their bone constraint: `shinR-footR` stretched to 55 % because a
-      // pinned foot cannot be pulled back by the solver, so the stretch has nowhere to
-      // go but the distance joint. The lag below settles the crouch 0.3 m higher but
-      // keeps the skeleton one piece, which is the trade that has to be made. Flyer
-      // heights are authored against the measured crouch top this produces
-      // (test/obstacle-check.mjs), not the other way round.
-      const hipVelY = hipVel[1];
+      // to be the wrong diagnosis for the *average* posture and a worse fix: the ring
+      // was already gone once the hip velocity was carried into the target (above),
+      // and the critical form, which reaches into the solver with a stiffer second
+      // order term, drove the pinned-foot legs past their bone constraint. `shinR-footR`
+      // stretched to 55 % because a pinned foot cannot be pulled back by the solver, so
+      // the stretch has nowhere to go but the distance joint. Soft wins that trade.
+      //
+      // The whip is a different problem, and it is a fairness one. Once the head chain
+      // has arrived at its tucked target it still carries upward momentum from the
+      // stride, so at certain phases it overshoots the fold by 0.7 m: measured at hip
+      // 0.38 m with the snout at 1.10 m, which is *above* the standing head bob. That
+      // is rare, about one stride in two thousand, but it is exactly the failure the
+      // duck cannot defend against, and it only shows up once the sim runs at a small
+      // enough step to resolve it. So the correction is one sided: a ducked bone that
+      // is already at or above where the fold wants it is not permitted to still be
+      // travelling up. Nothing is pushed down, so the standing gait and the tail are
+      // untouched, and the crouch is left free to bounce within its own envelope.
+      let vy = lerp(cur[1], clamp(hipVel[1] + offVelY, -cap, cap), ks) + weight;
+      if (duck && vy > 0 && w.pos[b + 1] >= wantY && spec.whipDamp) {
+        vy *= 1 - spec.whipDamp;
+      }
+
       w.setVelocity(
         i,
         lerp(cur[0], clamp(hipVel[0] + offVelX, -cap, cap), ks),
-        lerp(cur[1], clamp(hipVel[1] + offVelY, -cap, cap), ks) + weight,
+        vy,
         lerp(cur[2], clamp(hipVel[2] + offVelZ, -cap, cap), ks),
         1 / 60, w.substeps,
       );

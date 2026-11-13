@@ -32,8 +32,16 @@ export const STATE = {
   PAUSED: 'paused',
 };
 
-const FIXED = 1 / 120;
+// Exported because the envelope tests have to sample the body at the step the game
+// actually simulates at. The gait is dt-sensitive, so a test that stepped at a
+// different rate would be measuring an animal the player never plays.
+export const FIXED = 1 / 120;
 const MAX_FRAME = 0.1;          // never repay more than 100ms of lost time
+// A consequence of MAX_FRAME rather than a separate opinion: 0.1 s of backlog at
+// 1/120 is exactly 12 steps, and the extra couple are headroom for a frame that
+// lands just over the clamp. Hitting this cap means the tab is slower than about
+// 12 fps, at which point dropping time is the only sane answer.
+const MAX_SUBSTEPS = 14;
 const DEATH_DECAY = 3.6;        // how fast the corpse's forward speed bleeds off
 const SLOWMO_TIME = 0.32;
 const SLOWMO_SCALE = 0.34;
@@ -268,13 +276,33 @@ export class Game {
 
     this._sampleInput(dt);
 
-    if (this.state === STATE.PLAYING || this.state === STATE.DYING) {
-      this._simulate(dt);
-    } else {
-      // Menu and game-over still need the body to settle and the world to tick,
-      // but nobody is asking for clearance or hits.
-      this._simulateIdle(dt);
+    // The simulation is advanced in whole FIXED steps and the remainder is carried,
+    // rather than being handed the frame's dt. This is not tidiness. The gait is a
+    // driven spring system, so its answer depends on the step it is given: fed 1/60 it
+    // runs with its head at about 1.12 m, and fed the ~1/23 a stalled or backgrounded
+    // tab produces it collapses to roughly 0.90 m. That number is not cosmetic. A
+    // duckable flyer has to pass over the crouch and under the standing head, a window
+    // only about 0.22 m wide, so a frame-rate-dependent head height means whether the
+    // player is killed by the same obstacle depends on their refresh rate. Clamping to
+    // MAX_FRAME first is what stops a tab returning to the foreground from repaying
+    // thirty seconds of physics in one frame.
+    this._acc += dt;
+    let steps = 0;
+    while (this._acc >= FIXED && steps < MAX_SUBSTEPS) {
+      if (this.state === STATE.PLAYING || this.state === STATE.DYING) {
+        this._simulate(FIXED);
+      } else {
+        // Menu and game-over still need the body to settle and the world to tick,
+        // but nobody is asking for clearance or hits.
+        this._simulateIdle(FIXED);
+      }
+      this._acc -= FIXED;
+      steps++;
     }
+    // Dropping the backlog instead of banking it. Carrying a large remainder after
+    // hitting the cap would make the next frame try to catch up as well, and the
+    // slow-down would compound into the simulation never returning to real time.
+    if (steps >= MAX_SUBSTEPS) this._acc = 0;
 
     this._updateCamera(dt);
     this._present(dt);

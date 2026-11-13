@@ -667,8 +667,19 @@ export class WorldScene {
 
   _applyDaylight(timeOfDay, isNight) {
     const tod = clamp(timeOfDay, 0, 1);
-    const nightWeight = Math.pow(Math.sin(Math.PI * tod), 0.75);
-    const duskWeight = Math.pow(clamp(Math.sin(Math.PI * tod) * 2.1, 0, 1), 2.4) * (1 - nightWeight);
+    // A solar elevation, not a generic bump. The clock advances day -> night -> day, with
+    // game.isNight treating tod around 0 and 0.72..1 as night, so noon belongs at tod = 0.5
+    // and midnight at 0. This started out as sin(pi * tod), which peaks at 0.5 in the
+    // opposite sense: noon rendered as midnight and midnight as noon, and since isNight was
+    // written against the real clock, the HUD reported day while the screen showed stars.
+    // Deriving the weight from where the sun actually is makes the pixels and the flag
+    // agree, which is the only reason the flag exists.
+    const elev = -Math.cos(2 * Math.PI * tod);
+    const nightWeight = Math.pow(0.5 - 0.5 * elev, 0.75);
+    // Dusk wants the shoulders of the arc, where the sun sits on the horizon, rather than
+    // either extreme. Squaring the distance from the horizon keeps it narrow, and the
+    // (1 - nightWeight) factor stops the night palette bleeding orange into deep night.
+    const duskWeight = Math.pow(clamp((1 - Math.abs(elev)) * 2.1, 0, 1), 2.4) * (1 - nightWeight);
 
     const c = this._c;
     for (const k of KEYS) {

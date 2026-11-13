@@ -24,8 +24,28 @@ import assert from 'node:assert/strict';
 import { DinoRagdoll } from '../src/game/dino.js';
 import { CONFIG } from '../src/game/config.js';
 import { OBSTACLE_KINDS } from '../src/game/obstacles.js';
+import { FIXED } from '../src/game/game.js';
 
-const DT = 1 / 60;
+// The step the game simulates at, imported rather than restated. The gait is a driven
+// spring system and its answer depends on the step size it is handed: the same animal
+// crouches to different heights at 1/60 and 1/120. Measuring the fairness of flyer
+// heights at a step the player never experiences would make this file a ceremony.
+const DT = FIXED;
+
+// Warm-up and sampling are in seconds, not step counts, so changing DT cannot silently
+// shorten them: at 1/120 the old 300-step warm-up was 2.5 s, which is not enough for the
+// gait to settle at the top of the speed range, and a body still mid-transition reads as
+// a far taller crouch than one the player ever ducks behind.
+//
+// The sample is long on purpose, because the failure this file exists to catch turned out
+// to be a resonance and resonances are rare. The head-chain whip that put the snout at
+// 1.10 m while the hip sat at 0.38 m appeared on about one stride in two thousand,
+// roughly 30 s into a run at 4 m/s. A sample of a few seconds returns a beautifully clean
+// envelope and passes a game that kills ducking players at random. Shortening these
+// numbers makes this file decorative.
+const WARM_SECONDS = 12;
+const SAMPLE_SECONDS = 34;
+const stepsFor = (seconds) => Math.round(seconds / DT);
 
 // Worst-case jitter from ObstacleField._spawn: h scales by up to 1.1, w and d by up
 // to 1.14. If the test used nominal sizes the props could be tuned to pass here and
@@ -43,11 +63,11 @@ const JITTER_W = 1.14;
  */
 function flight(speed) {
   const d = new DinoRagdoll();
-  for (let i = 0; i < 200; i++) d.step(DT, { speed, ducking: false, laneZ: 0, dying: false });
+  for (let i = 0; i < stepsFor(3.5); i++) d.step(DT, { speed, ducking: false, laneZ: 0, dying: false });
   const x0 = d.pelvis.x;
   assert.ok(d.jump(CONFIG.jumpVelocity), 'the jump was refused');
   const samples = [];
-  for (let i = 0; i < 400; i++) {
+  for (let i = 0; i < stepsFor(7); i++) {
     d.step(DT, { speed, ducking: false, laneZ: 0, dying: false });
     if (d.airTime <= 0.04) { if (samples.length) break; else continue; }
     const b = d.hitBounds();
@@ -186,9 +206,14 @@ test('the tail cannot kill the player', () => {
 // test cannot quietly drift away from the thing it is supposed to be policing.
 const FLYERS = Object.entries(OBSTACLE_KINDS).filter(([, s]) => s.fly);
 
-// The full speed range a run can reach, because the gait drives the ring and the
-// ring is worst somewhere in the middle of it, not at the ends.
-const ENVELOPE_SPEEDS = [1.6, 2.2, 2.8, 3.4, 4.0, 4.6, 5.2, CONFIG.maxSpeed];
+// The full speed range a run can reach, sampled finely. The gait drives the ring, and
+// the ring is phase-locked to the stride, so whether a run hits the bad phase depends
+// on speed in a way that is close to arbitrary: with 8 coarse speeds the whip was
+// invisible and the envelope looked 2 cm safer than it is. 0.2 m/s is fine enough to
+// land near the worst phase at every point of the range.
+const ENVELOPE_SPEEDS = [];
+for (let v = 1.6; v < CONFIG.maxSpeed; v += 0.2) ENVELOPE_SPEEDS.push(+v.toFixed(2));
+ENVELOPE_SPEEDS.push(CONFIG.maxSpeed);
 
 /**
  * The worst vertical extent the hit box ever takes on in a posture, across the speed
@@ -205,10 +230,12 @@ function envelope(duck) {
   let hi = -Infinity;
   let minTop = Infinity;
   let worstAt = '';
+  const warm = stepsFor(WARM_SECONDS);
+  const sample = stepsFor(SAMPLE_SECONDS);
   for (const speed of ENVELOPE_SPEEDS) {
     const d = new DinoRagdoll();
-    for (let i = 0; i < 300; i++) d.step(DT, { speed, ducking: duck, laneZ: 0, dying: false });
-    for (let i = 0; i < 300; i++) {
+    for (let i = 0; i < warm; i++) d.step(DT, { speed, ducking: duck, laneZ: 0, dying: false });
+    for (let i = 0; i < sample; i++) {
       d.step(DT, { speed, ducking: duck, laneZ: 0, dying: false });
       const b = d.hitBounds();
       if (b.minY < lo) lo = b.minY;
