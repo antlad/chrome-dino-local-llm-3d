@@ -266,9 +266,33 @@ export class DinoRagdoll {
     // Leg metrics for the IK solver, measured off the skeleton rather than typed
     // into a config table. Two sources of the same number always drift apart, and
     // when they do the solver commands a shape the distance constraints refuse.
+    //
+    // Both the planar and the spatial length are kept, and the distinction is the
+    // whole reason this block is long. The gait drives a sagittal chain: a hip, a
+    // knee and an ankle that ought to travel in the animal's own side plane. The
+    // skeleton's rest pose is not quite that plane, because each leg hangs 10 cm off
+    // the centre line and the knee sits 10 cm out from the hip. So the femur's
+    // sagittal length is 0.3311 and its real length, the one `addDistance` enforces
+    // as a spherical constraint, is 0.3458, and hypot(0.3311, 0.100) is the
+    // difference exactly.
+    //
+    // Solving the chain with the sagittal number while the constraint holds the
+    // spatial one leaves 10 cm per bone with nowhere to go but sideways, and sideways
+    // is the only direction the planar solve has any authority over. The knee's
+    // lateral position is therefore a free variable that the solver settles wherever
+    // it likes. Measured before this was fixed: the left knee, whose hip sits at
+    // z = +0.10, spent 100 % of the stride past the middle of the animal at up to
+    // z = -0.33, both femurs stretched to 1.05x, and the hit box swung 0.43 m either
+    // side of the lane, which is what made the widest obstacle undodgeable.
     const seg = (a, b) => {
       const p = SKELETON[a], q = SKELETON[b];
-      return { len: Math.hypot(q.x - p.x, q.y - p.y), dx: q.x - p.x, dy: q.y - p.y };
+      return {
+        len: Math.hypot(q.x - p.x, q.y - p.y),
+        span: Math.hypot(q.x - p.x, q.y - p.y, q.z - p.z),
+        dz: q.z - p.z,
+        dx: q.x - p.x,
+        dy: q.y - p.y,
+      };
     };
     const femur = seg('pelvis', 'thighL');
     const tibia = seg('thighL', 'shinL');
@@ -277,9 +301,19 @@ export class DinoRagdoll {
       femur: femur.len,
       tibia: tibia.len,
       meta: meta.len,
+      // The lengths the distance constraints actually hold. Every span the IK
+      // commands has to be measured against these, not against the sagittal pair,
+      // or the surplus is paid laterally.
+      femurSpan: femur.span,
+      tibiaSpan: tibia.span,
+      // How far each joint sits out from the particle above it in the rest pose, so
+      // the solver can put a joint on its own side of the animal instead of on the
+      // centre line. Derived, not typed, for the usual reason.
+      kneeOut: femur.dz,
+      ankleOut: tibia.dz,
       toeX: meta.dx / (meta.len || 1),
       toeY: meta.dy / (meta.len || 1),
-      chain: femur.len + tibia.len,
+      chain: femur.span + tibia.span,
       // Vertical drop from hip to a planted toe at the rest pose. The IK solver
       // reads this to know how much horizontal reach it has left.
       standDrop: -SKELETON.footL.y,
@@ -287,8 +321,8 @@ export class DinoRagdoll {
       // keeps a leg from being commanded into a fold; the upper bound stops a
       // mis-measured target from demanding more than the chain can give, which is
       // what previously turned a stumble into the pelvis being dragged down.
-      minSpan: Math.abs(femur.len - tibia.len) + 0.03,
-      maxSpan: (femur.len + tibia.len) * 0.985,
+      minSpan: Math.abs(femur.span - tibia.span) + 0.03,
+      maxSpan: (femur.span + tibia.span) * 0.985,
     };
 
     this.phase = 0;
@@ -301,6 +335,11 @@ export class DinoRagdoll {
     /** Seconds a leg has spent at the end of its swing arc without landing. This is
      *  the difference between a late step and a seized gait. */
     this._swingOver = { L: 0, R: 0 };
+    /** 0..1 how far each leg has travelled into its airborne tuck, and the world
+     *  point it set off from. See the tuck entry in driveFeet. Scratch, never
+     *  allocated per frame. */
+    this._tuck = { L: 0, R: 0 };
+    this._tuckFrom = { L: { x: 0, y: 0 }, R: { x: 0, y: 0 } };
     /** Hip-behind-anchor distance at touchdown, the start of the scripted sweep. */
     this.behindTo = { L: 0, R: 0 };
     this.grounded = true;
@@ -453,6 +492,15 @@ export class DinoRagdoll {
     // Marks this flight as a committed leap rather than the running hop, so the
     // root uses the gentle arc gravity and the legs tuck. Cleared on landing.
     this._jumping = true;
+    // Both legs begin their tuck from where they actually are, not from the pose.
+    // Without this the first airborne frame commands a leg that is 0.62 m below the
+    // hip to a point 0.40 m below it, 0.30 m in front, in one 8 ms substep.
+    for (const side of SIDES) {
+      this._tuck[side] = 0;
+      const fb = this.i['foot' + side] * 3;
+      this._tuckFrom[side].x = w.pos[fb];
+      this._tuckFrom[side].y = w.pos[fb + 1];
+    }
     for (let p = 0; p < w.count; p++) {
       if (w.inv[p] === 0 || p === this.i.pelvis) continue;
       const cur = w.getVelocity(p, 1 / 60, w.substeps);
@@ -538,6 +586,13 @@ export class DinoRagdoll {
     this.phase = 0;
     this.grounded = true;
     this.airTime = 0;
+    // Cleared here as well as on landing. A run that ended mid-leap leaves the flag
+    // set, because the landing that clears it lives in driveRoot, and driveRoot never
+    // runs on a corpse. Leaving it set would hand the next run a jump it never asked
+    // for: the gentle arc gravity on its running hops, and, because a committed leap
+    // is what silences the stumble panic, legs that never scramble out of a step they
+    // genuinely missed.
+    this._jumping = false;
     this.noContact = 0;
     this.stepCount = 0;
     this.landImpact = 0;
@@ -550,6 +605,8 @@ export class DinoRagdoll {
     this.swingClock.R = 0;
     this._swingOver.L = 0;
     this._swingOver.R = 0;
+    this._tuck.L = 0;
+    this._tuck.R = 0;
   }
 
   releaseFoot(side) {
@@ -655,7 +712,12 @@ export class DinoRagdoll {
       this.rootVy = 0;
     }
 
-    this.rootZ += (this.laneZ - this.rootZ) * smooth(9, dt);
+    // The lane is a demand from the game; the pelvis is what the legs have to
+    // actually carry across the sand. Chasing it hard is what makes a strafe read as
+    // a lunge rather than a shuffle, but past about 12/s the hip outruns what a
+    // planted foot can brace against and the body leans into the turn hard enough to
+    // wobble the support leg.
+    this.rootZ += (this.laneZ - this.rootZ) * smooth(this.cfg.laneFollow, dt);
 
     const vx = speed;
     const vy = this.airTime > 0 ? this.rootVy : (this.rootY - this._lastRootY) / Math.max(dt, 1e-4);
@@ -816,9 +878,15 @@ export class DinoRagdoll {
    * does not we clamp to full extension rather than let the solver discover a new
    * equilibrium by dragging the pelvis into the sand.
    *
+   * `kneeZ` is the lateral line this leg's knee belongs on: the hip particle's own
+   * z plus the offset the rest skeleton gives that leg. It is passed in rather than
+   * derived here because the knee is not on the centre line and not at the foot
+   * either, and only the caller knows which side of the animal it is solving. See
+   * the long note below on why the knee is placed on it exactly.
+   *
    * Writes into `out` (thighX/Y/Z, shinX/Y/Z) to keep the frame allocation-free.
    */
-  solveLeg(px, py, pz, fx, fy, fz, kneeBias, out) {
+  solveLeg(px, py, kneeZ, fx, fy, fz, kneeBias, out) {
     const L = this.leg;
     const L0 = L.femur, L1 = L.tibia;
 
@@ -847,10 +915,31 @@ export class DinoRagdoll {
     if (nx < 0) { nx = -nx; ny = -ny; }
     out.thighX = px + ux * a + nx * h * kneeBias;
     out.thighY = py + uy * a + ny * h * kneeBias;
-    out.thighZ = lerp(pz, fz, 0.55);
+    // The knee goes on its own track, exactly, and this one equals sign is the whole
+    // reason the legs stopped crossing themselves.
+    //
+    // The hip and the ankle are both fixed by the solve above, so the knee sits at a
+    // fixed distance from each of them, which means it lies on a *circle* around the
+    // hip-to-ankle axis. Nothing in the constraint set picks a point on that circle:
+    // the femur and tibia are spheres, the knee angle is blind to rotation about the
+    // axis it sits on, and the only thing with an opinion is the posture servo, which
+    // is soft. Whatever the servo asks for, the solver is then free to disagree with,
+    // because the pose the planar solve produced does not actually satisfy the bones.
+    //
+    // That last part is the lever. The sagittal femur is 0.3311 and the bone holds
+    // 0.3458, so a knee placed with the correct lateral offset is the unique point on
+    // that circle that needs no correction at all: hypot(0.3311, 0.100) = 0.3458. Ask
+    // for it exactly and the solver has nothing to fix. Blend it toward the foot by
+    // any amount, as this line used to, and the pose arrives wrong by a few
+    // centimetres of length, the solver pays that out sideways to satisfy the sphere,
+    // and it pays it at whatever azimuth it happens to feel like. Measured that way:
+    // the left knee reached z = -0.33 on an animal whose left hip sits at +0.10, with
+    // both femurs stretched to 1.05x and the hit box 0.43 m wide.
+    out.thighZ = kneeZ;
     out.shinX = cx;
     out.shinY = cy;
-    out.shinZ = lerp(pz, fz, 0.8);
+    // The ankle belongs to the foot's own track, which is where the toe is planted.
+    out.shinZ = fz;
     return out;
   }
 
@@ -908,6 +997,10 @@ export class DinoRagdoll {
       const shin = this.i['shin' + side];
       const b = foot * 3;
       const r = w.radius[foot];
+      // Where this leg's own knee and ankle belong, laterally. The pelvis is a single
+      // particle at the centre of the animal, so neither of these is pz, and solving
+      // the chain against pz is what had both knees tracking toward the middle line.
+      const kneeZ = pz + SKELETON['thigh' + side].z;
       const laneZ = this.laneZ + SKELETON['foot' + side].z;
 
       if (this.stance[side]) {
@@ -922,7 +1015,15 @@ export class DinoRagdoll {
         // surplus.
         const ax = this.plantX[side] - this.leg.toeX * this.leg.meta;
         const ay = r - this.leg.toeY * this.leg.meta;
-        const want = Math.hypot(px - ax, bodyTarget - ay);
+        // The span has to be measured in three dimensions, because the constraint it
+        // becomes is three dimensional. `want` is written into the hip-to-ankle strut
+        // as its rest length, and that strut joins the pelvis particle to the ankle
+        // particle, which are 11 cm apart sideways as well as apart vertically. Give
+        // that constraint a flat length and it is permanently 11 cm too short, so it
+        // spends the whole of stance hauling the ankle toward the centre line. The
+        // foot is pinned and cannot answer, so the pull goes into the knee instead,
+        // and the knee is the only joint in the chain free to move sideways.
+        const want = Math.hypot(px - ax, bodyTarget - ay, pz - this.plantZ[side]);
         if (want > this.leg.maxSpan) {
           const excess = want - this.leg.maxSpan;
           const slip = clamp(excess / Math.max(dt, 1e-4), 0, this.cfg.maxLimbSpeed);
@@ -933,11 +1034,21 @@ export class DinoRagdoll {
 
         // The toe is nailed to the sand, so the ankle is known exactly, and the
         // hip height the gait wants is known. That pins the leg length, and the
-        // knee follows from the two-bone solution. Nothing here asks the ankle or
-        // the toe to move; they are already where they should be.
-        this.solveLeg(px, py, pz, this.plantX[side], r, this.plantZ[side], this.cfg.kneeBias, out);
+        // knee follows from the two-bone solution. Nothing here asks the toe to
+        // move; it is already where it should be.
+        //
+        // The ankle is a different matter, and the earlier comment here claimed it
+        // needed no command because it was "already where it should be". It is not
+        // pinned, only the toe under it is, and the two bones meeting at it each
+        // hold slightly more length laterally than the planar solve accounts for. Left
+        // with no target it wandered as far as 0.34 m off its own track, which is
+        // wider than the lane change it is supposed to be standing still for. Swing
+        // already servoos the shin for exactly this reason; stance has the same joint
+        // and was simply never given the same treatment.
+        this.solveLeg(px, py, kneeZ, this.plantX[side], r, this.plantZ[side], this.cfg.kneeBias, out);
         this.setExtension(side, want);
         this.driveBone(thigh, out.thighX, out.thighY, out.thighZ, dt, this.cfg.postureStiff);
+        this.driveBone(shin, out.shinX, out.shinY, out.shinZ, dt, this.cfg.postureStiff);
 
         const behind = px - this.plantX[side];
         if (this.stanceTime[side] >= dur || behind > this.cfg.maxReach || this.stanceTime[side] > 0.6) {
@@ -970,11 +1081,22 @@ export class DinoRagdoll {
         // cactus at 1.4 m and the dangling foot knocked it over anyway. A tuck is
         // hip-relative, so as the body rises the feet rise with it. This is the
         // single change that turns obstacles from walls into hurdles.
-        targetX = px + this.cfg.airReach;
-        // Floor the target a little below the hip rather than right at it, so the
-        // knee has somewhere to go. The IK cannot fold a leg into a point, and a
-        // target at the hip makes it solve for a nearly straight leg hanging down.
-        targetY = Math.max(r, py - this.cfg.airTuck);
+        //
+        // The tuck is entered over airTuckTime rather than assumed on frame one, and
+        // it travels from where the foot is to where the pose wants it. Commanding
+        // the finished pose immediately was the remaining half of the twitch: at
+        // takeoff a foot is on the sand, 0.62 m under the hip, and the tuck wants it
+        // 0.40 m under and 0.30 m in front, so the servo aimed a 0.68 m correction at
+        // a 1/120 s step. The gain in driveBone turns that directly into a foot
+        // velocity of 8 m/s, which is a kick, and the first eight frames of every
+        // leap were that kick and its correction. Blending from the foot's own
+        // position means the error the servo sees on frame one is exactly zero
+        // and grows from there, so the legs fold into the tuck as a motion instead of
+        // arriving in it.
+        const k = easeOut(this._tuck[side]);
+        const from = this._tuckFrom[side];
+        targetX = lerp(from.x - px, this.cfg.airReach, k) + px;
+        targetY = Math.max(r, lerp(from.y - py, -this.cfg.airTuck, k) + py);
       } else {
         this.swingClock[side] += dt;
         t = clamp(this.swingClock[side] / swingDur, 0, 1);
@@ -985,7 +1107,12 @@ export class DinoRagdoll {
         targetY = r + Math.max(0.015, lift);
       }
 
-      this.solveLeg(px, py, pz, targetX, targetY, laneZ, this.cfg.kneeBias, out);
+      this.solveLeg(px, py, kneeZ, targetX, targetY, laneZ, this.cfg.kneeBias, out);
+      if (air) {
+        // Advance the tuck entry. Clamped at 1 so it costs nothing once it is spent,
+        // and re-armed by jump(), which is the only thing that sets `air` here.
+        this._tuck[side] = Math.min(1, this._tuck[side] + dt / this.cfg.airTuckTime);
+      }
       // The foot leads, the knee follows it. Servoing the foot first and the knee
       // against the same solution keeps the chain coherent instead of three
       // independent springs arguing. The strut is commanded to the same length the
@@ -1045,6 +1172,16 @@ export class DinoRagdoll {
     // arriving, not one that is hovering.
     const stuckAfter = this.cfg.swingStuck ?? 0.22;
     const stuck = this._swingOver.L > stuckAfter || this._swingOver.R > stuckAfter;
+    // Not while the animal is in a leap it chose. The two conditions above are
+    // asking "has a foot failed to arrive", and during a committed jump the honest
+    // answer is yes: the legs are deliberately off the sand and holding a tuck, so
+    // `noContact` passes 0.16 s about a tenth of a second after takeoff and the
+    // panic fired on 128 of the 148 airborne frames of a normal jump. scramble throws
+    // the feet forward and down at a target the tuck is simultaneously pulling up and
+    // back, so the two controllers argued through the skeleton for the whole flight.
+    // Panic is for a stumble, which is an animal that means to be running; a jump is
+    // an animal that means to be flying, and gravity already owns its landing.
+    if (this._jumping) return;
     if (this.noContact > 0.16 || stuck) this.scramble(speed);
   }
 
@@ -1089,7 +1226,24 @@ export class DinoRagdoll {
     this.stance[side] = true;
     this.stanceTime[side] = 0;
     this.plantX[side] = w.pos[b];
-    this.plantZ[side] = w.pos[b + 2];
+    // The foot is planted on its own track, not wherever it happened to be.
+    //
+    // The lateral part of the contact was read off the foot and then never moved
+    // again, which looked harmless because the swing puts the foot roughly on its
+    // track anyway. It is not harmless, because the foot is not exact, and the value
+    // is a permanent record. A leg that arrives a few centimetres inboard gets to
+    // stay there for the whole of stance, and stance is where the gait decides where
+    // the knee goes: out.thighZ is a blend of the hip and this number. A foot caught
+    // inboard therefore pulls the knee inboard with it, the knee drags the hip-side
+    // of the femur round toward the middle of the pelvis, the next swing launches
+    // from there, and the next touchdown records that too. It is a ratchet, and it
+    // ran the left knee to z = -0.33 for an animal whose left hip sits at +0.10, so
+    // both legs spent the entire stride crossed over one another.
+    //
+    // The foot is told where its track is during swing, so stance can simply agree
+    // with it. A real runner plants under its own hip, on its own line; a stride that
+    // lands across the body is not a style, it is a fall.
+    this.plantZ[side] = this.laneZ + SKELETON['foot' + side].z;
     this.behindTo[side] = this.world.pos[this.i.pelvis * 3] - this.plantX[side];
 
     // Absorb the arrival instead of keeping it. A foot arriving at 6 m/s and then

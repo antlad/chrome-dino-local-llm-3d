@@ -23,8 +23,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DinoRagdoll } from '../src/game/dino.js';
 import { CONFIG } from '../src/game/config.js';
-import { OBSTACLE_KINDS } from '../src/game/obstacles.js';
+import { OBSTACLE_KINDS, ObstacleField } from '../src/game/obstacles.js';
 import { FIXED } from '../src/game/game.js';
+
+// Spacing is the field's business, so the field itself is asked rather than the
+// numbers being copied in here. Two files agreeing on a gap by coincidence is how
+// the last one went wrong.
+const FIELD = new ObstacleField();
 
 // The step the game simulates at, imported rather than restated. The gait is a driven
 // spring system and its answer depends on the step size it is handed: the same animal
@@ -156,19 +161,17 @@ test('the apex clears the tallest prop', () => {
 // every individual prop stays individually clearable, which is the exact failure
 // that made this unplayable. So the field's own airtime is checked against the
 // measured hang rather than against an assumption.
-test('the field spaces props using the arc the ragdoll actually performs', async () => {
-  const { ObstacleField } = await import('../src/game/obstacles.js');
-  const field = new ObstacleField();
+test('the field spaces props using the arc the ragdoll actually performs', () => {
   const measured = flight(CONFIG.baseSpeed).length * DT;
   assert.ok(
-    Math.abs(field.airtime - measured) < 0.22,
-    `field assumes ${(field.airtime).toFixed(2)} s of airtime but the ragdoll measures `
+    Math.abs(FIELD.airtime - measured) < 0.22,
+    `field assumes ${(FIELD.airtime).toFixed(2)} s of airtime but the ragdoll measures `
     + `${measured.toFixed(2)} s; gaps are being derived from the wrong jump`,
   );
 
   // And the gap it demands at top speed has to be enough to land, re-plant, and
   // jump again: at least a full arc of travel plus the body.
-  const gap = field.minGapFor(CONFIG.maxSpeed);
+  const gap = FIELD.minGapFor(CONFIG.maxSpeed);
   const needed = measured * CONFIG.maxSpeed;
   assert.ok(gap > needed,
     `min gap ${gap.toFixed(2)} m is shorter than one jump arc (${needed.toFixed(2)} m) at top speed`);
@@ -266,6 +269,11 @@ const FLY_BOB = 0.03;
 // disagree with the game about whether a contact happened.
 const HIT_PAD = 0.055;
 
+// How far off the running line ObstacleField._spawn is allowed to put a ground prop.
+// Its laneSpread is 0.16 for anything that sits on the sand; a dodge has to survive
+// the prop being parked at either end of that, on the side that matters.
+const GROUND_PROP_Z = 0.16;
+
 for (const [kind, spec] of FLYERS) {
   test(`${kind} is passable by ducking or by jumping`, () => {
     // The belly has two worst cases and they come from different rolls, so both have
@@ -339,3 +347,121 @@ test('the crouch holds while the key is held', () => {
   assert.ok(peak < 0.90,
     `the crouched box reached ${peak.toFixed(2)} m at frame ${peakFrame} of a sustained hold`);
 });
+
+// --- the third axis -----------------------------------------------------------------
+//
+// Everything above answers "can the jump clear it" and "can the crouch clear it".
+// Neither question is about the strafe, which is the third thing a player can do and
+// the only way past a ground prop without leaving the sand.
+//
+// That blind spot was not hypothetical. At the previous laneWidth of 0.62 m the
+// cactus-cluster could not be dodged from *any* lane at *any* speed, because the prop
+// is 0.525 m deep at full jitter, sits up to 0.16 m off the running line, and the
+// animal's own hit box swings 0.48 m either side of the lane centre during a stride.
+// The rock left 3 mm. Every test in this file passed, because every test in this file
+// was about jumping.
+//
+// So the strafe gets the same treatment as the arc: for each ground prop, at each
+// legal speed and each legal prop offset, some lane has to put the hit box wholly
+// outside the prop's depth, with the same margin a jump needs.
+
+// Settled per lane, not sampled mid-slide: a body still travelling to a lane reads
+// as a box straddling two of them, which would report a dodge as impossible for a
+// reason the player never experiences. The stride swing is the opposite case, it is
+// real and it is the thing that eats the clearance, so each lane is sampled across
+// enough strides to catch the widest leg extension. Memoised because every prop
+// against every offset asks for the same handful of boxes.
+const laneBoxCache = new Map();
+function laneBox(speed, lane) {
+  const key = `${speed}|${lane.toFixed(3)}`;
+  if (laneBoxCache.has(key)) return laneBoxCache.get(key);
+  const d = new DinoRagdoll();
+  const cmd = { speed, ducking: false, laneZ: lane, dying: false, slowmo: 1 };
+  for (let i = 0; i < stepsFor(8); i++) d.step(DT, cmd);
+  let minZ = Infinity, maxZ = -Infinity;
+  for (let i = 0; i < stepsFor(14); i++) {
+    d.step(DT, cmd);
+    const b = d.hitBounds();
+    if (b.minZ < minZ) minZ = b.minZ;
+    if (b.maxZ > maxZ) maxZ = b.maxZ;
+  }
+  // checkHit shrinks the box before testing it, so this is the box that kills.
+  const box = { minZ: minZ + HIT_PAD, maxZ: maxZ - HIT_PAD };
+  laneBoxCache.set(key, box);
+  return box;
+}
+
+const LANE_RANGE = CONFIG.laneCount > 1 ? (CONFIG.laneCount - 1) / 2 : 0.5;
+const LANE_LIMIT = LANE_RANGE * CONFIG.laneWidth;
+const LANES = [-LANE_LIMIT, 0, LANE_LIMIT];
+
+// The field puts a ground prop up to this far off the running line (laneSpread in
+// ObstacleField._spawn), and both directions have to be survivable.
+const PROP_OFFSETS = [-GROUND_PROP_Z, 0, GROUND_PROP_Z];
+
+for (const speed of SPEEDS) {
+  for (const [kind, spec] of GROUND) {
+    // Computed here so the assertion message can name the worst case, which is the
+    // number a person retuning laneWidth is going to want. The depth comes from the
+    // kind table rather than the GROUND literal above, which only carries the two
+    // dimensions the vertical arc cares about.
+    const halfD = (OBSTACLE_KINDS[kind].d * JITTER_W) / 2;
+    let worst = Infinity, worstOffset = 0;
+    for (const propZ of PROP_OFFSETS) {
+      const propMin = propZ - halfD, propMax = propZ + halfD;
+      let best = -Infinity;
+      for (const lane of LANES) {
+        const b = laneBox(speed, lane);
+        // Positive only when the two boxes do not overlap in z at all.
+        const slack = propMax <= b.minZ ? b.minZ - propMax
+          : b.maxZ <= propMin ? propMin - b.maxZ
+            : -Infinity;
+        if (slack > best) best = slack;
+      }
+      if (best < worst) { worst = best; worstOffset = propZ; }
+    }
+    const depth = OBSTACLE_KINDS[kind].d * JITTER_W;
+    test(`${kind} is dodgeable at ${speed} m/s`, () => {
+      assert.ok(worst > 0,
+        `${kind} at ${speed} m/s cannot be dodged at all. With the prop ${(worstOffset * 100).toFixed(0)} cm ` +
+        `off the line and ${depth.toFixed(2)} m deep, no lane out of ` +
+        `${LANES.map((l) => l.toFixed(2)).join(', ')} gets the hit box clear of it. The strafe is ` +
+        'decoration and jumping is the only answer.');
+      assert.ok(worst >= MARGIN,
+        `${kind} at ${speed} m/s: the best lane leaves ${worst.toFixed(3)} m of lateral slack against ` +
+        `a prop offset of ${worstOffset.toFixed(2)} m, under the ${MARGIN} m needed to commit to a ` +
+        'lane without a frame-perfect press.');
+    });
+  }
+}
+
+// Width alone is not enough; the animal has to be able to *get there*. A lane change
+// that cannot be committed inside the ground available between two props is the same
+// as a lane that does not exist, and the previous numbers were exactly that: 1.5 m/s
+// of drift took 0.42 s to cross 0.62 m, and the pelvis then lagged the lane target
+// behind a rate-9 spring, so the body was a third of the way across when the next prop
+// arrived. The budget is the field's own minimum gap divided by speed, which is how
+// much ground a player actually has to react.
+for (const speed of SPEEDS) {
+  const budget = FIELD.minGapFor(speed) / speed;
+  test(`a lane change commits inside the gap between two props at ${speed} m/s`, () => {
+    const d = new DinoRagdoll();
+    const cmd = { speed, ducking: false, laneZ: -LANE_LIMIT, dying: false, slowmo: 1 };
+    for (let i = 0; i < stepsFor(6); i++) d.step(DT, cmd);
+    cmd.laneZ = LANE_LIMIT;
+    let seconds = 0;
+    while (seconds < budget * 2 && Math.abs(d.pelvis.z) < LANE_LIMIT * 0.95) {
+      d.step(DT, cmd);
+      seconds += DT;
+    }
+    assert.ok(Math.abs(d.pelvis.z) >= LANE_LIMIT * 0.95,
+      `at ${speed} m/s the pelvis never arrived (${d.pelvis.z.toFixed(3)} of ${LANE_LIMIT.toFixed(3)} m): ` +
+      'the lane is a request the body ignores');
+    assert.ok(seconds < budget,
+      `at ${speed} m/s a lane change took ${seconds.toFixed(2)} s of the ${budget.toFixed(2)} s ` +
+      'available between two props, so the strafe cannot be committed in time');
+    assert.ok(d.hipHeight > 0.55,
+      `at ${speed} m/s the strafe toppled the animal (hip ${d.hipHeight.toFixed(2)} m): easing the ` +
+      'drift in faster than the pelvis can be dragged leaves the feet behind');
+  });
+}

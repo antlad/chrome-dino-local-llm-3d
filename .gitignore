@@ -4,3 +4,9 @@ node_modules/
 .shots-tmp/
 
 .shots-browser/
+
+# Diagnostic probes and one-off measurement scripts. They are how the tuning
+# decisions in config.js were arrived at, and the reasoning they produced is
+# reproduced in the comments where it matters, so the scripts themselves are not
+# part of the deliverable.
+.scratch/

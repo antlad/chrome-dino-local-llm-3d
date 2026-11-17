@@ -32,9 +32,30 @@ export const CONFIG = {
   deathDecay: 6.5,         // how fast the world stops after a hit (m/s^2)
 
   // --- lane changing ---------------------------------------------------
+  // The dino's whole evasive repertoire is this one axis, so its two numbers are
+  // the difficulty of the game rather than its flavour. The original pair made it
+  // harder than it reads: 1.5 m/s of drift across 0.62 m of lane took 0.42 s to
+  // commit to the next lane, and at the top speed of 5.4 m/s that is 2.3 m of ground
+  // spent mid-move, which is more than the field's own minimum gap between props.
+  // A lane change could not be completed between two obstacles, so the only answer
+  // to a prop you could plainly see was to jump it.
+  //
+  // Both ends of that moved. The drift is 2.9 m/s, so a lane is committed in well
+  // under the time it takes to reach the next prop, and the lanes themselves are
+  // 0.95 m apart, which is wider than the animal's own hit box across Z. Moving is
+  // now an option that pays: a held key actually relocates the dino out of a prop's
+  // footprint instead of nudging it toward the edge of one.
+  //
+  // laneEase matters because the number is no longer gentle. The ragdoll's pelvis
+  // chases laneZ through a velocity spring, and stepping that demand from 0 to 2.9
+  // m/s in one frame is a lateral jerk the legs have to absorb through the hip while
+  // one of them is nailed to the sand. The first order lag costs 60 ms off the start
+  // of the move and buys back the whole wobble that the step would have caused.
   laneCount: 3,
-  laneWidth: 0.62,
-  laneSpeed: 1.5,          // m/s of lateral drift for held strafe keys
+  laneWidth: 0.95,         // m between lane centres
+  laneSpeed: 2.9,          // m/s of lateral drift for held strafe keys
+  laneEase: 8.5,           // 1/s: how fast the drift chases and releases laneSpeed
+  laneFollow: 12,          // 1/s: how fast the pelvis catches up with the lane
 
   // --- jump ------------------------------------------------------------
   // The body arc and the solver use different gravity, on purpose. The legs are
@@ -76,15 +97,61 @@ export const CONFIG = {
   // test/obstacle-check.mjs: at 0.46 the crouched box peaked at 1.00 m, which is
   // above every flyer's underside and made ducking useless. See AXIAL in dino.js,
   // where the head and snout fold with it.
-  duckHeight: 0.40,
+  //
+  // It reads 0.04 lower than it used to because the number is now telling the truth.
+  // The hip-to-ankle strut that holds this height up joins two particles that sit
+  // 11 cm apart sideways, and it was being commanded the flat, sagittal distance
+  // between them. That made the muscle permanently about 11 cm shorter than the gait
+  // intended, so every crouch measured 0.05 m lower than the figure asked for, and
+  // the old value was tuned to suit that error rather than the posture. With the span
+  // measured in three dimensions, 0.40 puts the crouched box at 0.913 m, which is
+  // above the 0.90 m the lowest duckable belly reaches, and 0.36 puts it at 0.863 m
+  // with 3.6 cm of the animal's own belly below the sand. Any lower and the toes
+  // start digging.
+  duckHeight: 0.36,
   swingHeight: 0.16,       // how high a swinging foot clears the sand
   // During a committed leap the feet are pulled up under the body rather than
   // reaching for the ground. Without this the swing solver drives the toes toward
   // a *world* height near the sand while the hip is at 1.4 m, so the legs hang
   // straight down to 0.38 m and the body's lowest point is below every obstacle's
   // top: no obstacle in the game could be jumped. These are hip-relative.
-  airTuck: 0.30,           // m below the hip a tucked foot is held at
-  airReach: 0.14,          // m ahead of the hip a tucked foot sits
+  //
+  // The two numbers are also the difference between a tuck and a leg seizure, and
+  // they have to be solved together against the hip's hard angle limit (`lo: 0.50`
+  // in JOINTS). The target is a *toe*, and solveLeg pulls the ankle back off it by
+  // the foot vector, so the hip-to-ankle span is `hypot(airReach - toeX*meta,
+  // -(airTuck - toeY*meta))`. At the old 0.30/0.14 that span was 0.27 m, which two
+  // bones of 0.331 and 0.533 can only reach by folding the hip to 0.42 rad: below
+  // the limit. So every airborne frame the IK asked for a shape the joint refused,
+  // the limit kicked it back, and the next frame asked again. Measured over one
+  // leap, the hip sat clamped at that fold for 77 % of the flight, the ankle angle
+  // swept 0.86 -> 2.26 rad, and the feet changed direction 39 times a second. That
+  // argument, fought every frame against a hard stop, is what looked like twitching.
+  //
+  // Getting out of the clamp is a two dimensional problem, and the axis nobody had
+  // considered is `airReach`. The ankle sits *behind* the toe by the foot vector, so
+  // a foot held directly under the hip has a short hip-to-ankle span no matter how
+  // far it is lifted, and short spans are exactly what fold the hip. Pushing the toe
+  // forward instead lengthens the span directly: at 0.28/0.48 the commanded hip is
+  // 0.71 rad, comfortably clear of the limit, and the leg is free to hold still.
+  //
+  // Reach is also the axis that decides whether a jump can clear anything, which is
+  // why this pair was chosen over a deeper tuck. Raising `airTuck` pulls the knee and
+  // the mass of the shin up but leaves the toe hanging, and the hit box is measured
+  // from the lowest point, so a deep tuck buys almost nothing in clearance while
+  // costing a great deal of leg reach. The grid says it plainly: at 0.40/0.30 the
+  // tightest case in the game, `cactus-tall` at the starting speed, has 0.01 m of
+  // spare room against its test budget. At 0.28/0.48 the same case has 0.30 m. The
+  // feet are held high enough to clear the prop because they are held in *front* of
+  // the body, not because they are held close to it.
+  //
+  // The limit is deliberately not just raised instead. `lo` is what stops a landing
+  // leg folding through the chest, and it does that job every stance; opening it to
+  // accommodate a pose the gait never needed would weaken the joint that carries the
+  // animal's weight to fix a joint that carries nothing.
+  airTuck: 0.28,           // m below the hip a tucked foot is held at
+  airReach: 0.48,          // m ahead of the hip a tucked toe sits
+  airTuckTime: 0.06,       // s: the legs fold into the tuck over this, not in a frame
   supportBlend: 16,        // 1/s: how fast the hip climbs onto the support leg
   forwardBlend: 10,        // 1/s: how hard the planted leg drags the body along
   maxAccel: 26,            // m/s^2: the most the root may chase the commanded speed

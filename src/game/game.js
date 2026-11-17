@@ -18,7 +18,7 @@
 // the clamp a background tab coming back to the foreground would try to repay
 // thirty seconds of simulation in one frame and hang the page.
 
-import { CONFIG, clamp, lerp } from './config.js';
+import { CONFIG, clamp, lerp, smooth } from './config.js';
 import { DinoRagdoll } from './dino.js';
 import { ObstacleField } from './obstacles.js';
 
@@ -76,6 +76,8 @@ export class Game {
     this.startX = 0;
     this.laneZ = 0;
     this.targetLaneZ = 0;
+    /** Current lateral drift in m/s, eased toward the strafe key's demand. */
+    this._driftVel = 0;
     this.timeOfDay = 0.22;
     this.isNight = false;
     this.deathTimer = 0;
@@ -184,6 +186,7 @@ export class Game {
     this.speed = CONFIG.baseSpeed * 0.55;
     this.laneZ = 0;
     this.targetLaneZ = 0;
+    this._driftVel = 0;
     this.deathTimer = 0;
     this.slowmo = 1;
     this.hitFlash = 0;
@@ -335,8 +338,29 @@ export class Game {
 
       const axis = input.strafeAxis();
       const range = CONFIG.laneCount > 1 ? (CONFIG.laneCount - 1) / 2 : 0.5;
-      this.targetLaneZ = clamp(this.targetLaneZ + axis * CONFIG.laneSpeed * dt,
-        -range * CONFIG.laneWidth, range * CONFIG.laneWidth);
+      const limit = range * CONFIG.laneWidth;
+
+      // The strafe is a rate the body chases, not a position the keys write. Two
+      // reasons it cannot just be `targetLaneZ += axis * laneSpeed * dt`.
+      //
+      // First, the ragdoll turns that position into a velocity, `vz = (laneZ -
+      // pelvisZ) / dt`, and hands it to a pinned pelvis. Stepping the demand from 0
+      // to 2.9 m/s between one frame and the next is therefore a lateral jerk taken
+      // through the hip of an animal standing on a foot that cannot move, which is
+      // how a fast strafe turns into a wobble. The lag ramps it over roughly 120 ms
+      // instead, and the legs feel a slope rather than a step.
+      //
+      // Second, it lets go properly. Easing toward 0 when the key is up means the
+      // animal coasts out of the move rather than stopping dead mid-drift, and it
+      // means a tap still produces a real, bounded sidestep: the drift only ever
+      // reaches the speed the held key asked for, never banks up surplus.
+      const want = axis * CONFIG.laneSpeed;
+      this._driftVel = lerp(this._driftVel, want, smooth(CONFIG.laneEase, dt));
+      this.targetLaneZ = clamp(this.targetLaneZ + this._driftVel * dt, -limit, limit);
+      // Parked at the wall, the drift has nowhere to go, so it is dropped rather than
+      // held as a debt that would be paid the moment the player comes back off it.
+      if (this.targetLaneZ <= -limit + 1e-6 && this._driftVel < 0) this._driftVel = 0;
+      if (this.targetLaneZ >= limit - 1e-6 && this._driftVel > 0) this._driftVel = 0;
 
       this.ducking = input.ducking;
     } else {

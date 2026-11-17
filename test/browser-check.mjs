@@ -186,20 +186,53 @@ async function key(type, keyName, code) {
 const press = (k, code) => key('keyDown', k, code);
 const release = (k, code) => key('keyUp', k, code);
 
-await press(' ', 'Space');
-await sleep(350);
-const air = await evaluate(`window.dino3d.game.dino.airTime`);
-ok('space makes it jump in the browser', air > 0, 'airTime=' + air);
+/**
+ * Press, then poll for the consequence, re-pressing until it shows or the budget is
+ * spent.
+ *
+ * A single dispatch is not reliable here, and the reason is the harness rather than the
+ * game. `visible()` raises the tab before and after every event, and raising is a
+ * request, so `visibilityState` can flip across `hidden` in the middle of a press.
+ * main.js answers that flip with `input.releaseAll()`, which deliberately clears the
+ * held keys and the jump buffer, because a jump buffered before a tab switch is a jump
+ * the player has stopped asking for. On a headless renderer at roughly 13 fps the
+ * buffer only has to survive one frame of 77 ms, so losing that race is uncommon but
+ * not rare, and it surfaced as an occasional "space makes it jump" failure that no
+ * change to the game could fix.
+ *
+ * Re-dispatching keeps the thing actually under test: a real key event travelling the
+ * real path through Input, including the buffering. Five genuine attempts that all
+ * fail is a game failure, which is what the assertion is for.
+ */
+async function pressFor(pressFn, check, attempts = 5) {
+  for (let i = 0; i < attempts; i++) {
+    await pressFn();
+    for (let t = 0; t < 14; t++) {
+      if (await check()) return true;
+      await sleep(60);
+    }
+  }
+  return false;
+}
+
+const jumped = await pressFor(
+  () => press(' ', 'Space'),
+  async () => (await evaluate(`window.dino3d.game.dino.airTime`)) > 0);
+ok('space makes it jump in the browser', jumped,
+  'airTime=' + await evaluate(`window.dino3d.game.dino.airTime`));
 await shot(c, OUT + '/03-jump.png');
 await release(' ', 'Space');
 await sleep(1600);
 const landed = await evaluate(`window.dino3d.game.dino.airTime`);
 ok('it comes back down', landed <= 0.05, 'airTime=' + landed);
 
-await press('ArrowDown', 'ArrowDown');
-await sleep(900);
-const duckHip = await evaluate(`window.dino3d.game.dino.hipHeight`);
-ok('down ducks in the browser', duckHip < 0.72, 'hip=' + duckHip);
+// Same treatment for the duck. It reads a held key rather than a buffered press, so a
+// stray releaseAll leaves the animal standing with no key down and the hip never drops.
+const ducked = await pressFor(
+  () => press('ArrowDown', 'ArrowDown'),
+  async () => (await evaluate(`window.dino3d.game.dino.hipHeight`)) < 0.72);
+ok('down ducks in the browser', ducked,
+  'hip=' + await evaluate(`window.dino3d.game.dino.hipHeight`));
 await shot(c, OUT + '/04-duck.png');
 // Released for real, through the key path, rather than by mutating `held` later on. The
 // trials that follow need a standing animal, and a stale held key is invisible in their
@@ -364,25 +397,29 @@ ok('restart plays again', (await evaluate(`window.dino3d.game.state`)) === 'play
 // wrong, which is exactly the bug that was here: the darkness weight used
 // pow(sin(pi * tod), 0.75), which peaks at tod = 0.5, so noon rendered as midnight while
 // the HUD's own isNight flag said otherwise.
-const skyRead = `(() => { const u = window.dino3d.worldScene._skyUniforms;
-  const h = (c) => '#' + c.getHexString();
+// Set and read inside one evaluate, which is the whole point of this section.
+//
+// The lighting is a pure function of timeOfDay, so it can be exercised directly rather
+// than by waiting for a frame to happen to arrive. But the game loop is still running
+// while this runs, and it repaints the sky from `game.timeOfDay` on every frame. Two
+// separate calls left a gap for exactly one frame to land in there: the set wrote noon,
+// a frame repainted the uniform from whatever the clock had drifted to, and the read
+// returned that instead. It showed up as a rare failure in which day and night reported
+// the identical colour, because both samples had been overwritten by the same frame.
+//
+// Within a single evaluate nothing can interleave, since JS is single threaded, so the
+// value being asserted on is the value setPalette just produced.
+const skyAt = (t, night) => evaluate(`(() => {
+  const g = window.dino3d.game; g.timeOfDay = ${t}; g.isNight = ${night};
+  const w = window.dino3d.worldScene; w.setPalette(${t}, ${night});
+  const u = w._skyUniforms; const h = (c) => '#' + c.getHexString();
   return { top: h(u.topColor.value), mid: h(u.midColor.value),
     stars: +u.starAmount.value.toFixed(3),
-    fog: '#' + window.dino3d.worldScene.scene.fog.color.getHexString() }; })()`;
+    fog: '#' + w.scene.fog.color.getHexString() }; })()`);
 
-// Driven through the same entry point frame() uses, rather than waiting for a frame to
-// happen to arrive. Waiting on frame delivery made this check measure the harness's
-// tab-visibility luck instead of the lighting; the lighting is a pure function of
-// timeOfDay, so it can be exercised directly and deterministically.
-const setTOD = (t, night) => evaluate(
-  `(() => { const g = window.dino3d.game; g.timeOfDay = ${t}; g.isNight = ${night};
-     window.dino3d.worldScene.setPalette(${t}, ${night}); })()`);
-
-await setTOD(0.5, false);
-const day = await evaluate(skyRead);
+const day = await skyAt(0.5, false);
 await shot(c, OUT + '/08-day.png');
-await setTOD(0.02, true);
-const night = await evaluate(skyRead);
+const night = await skyAt(0.02, true);
 await shot(c, OUT + '/09-night.png');
 ok('night actually darkens the sky', day.top !== night.top && day.stars < night.stars,
   `day ${JSON.stringify(day)} vs night ${JSON.stringify(night)}`);
